@@ -24,9 +24,12 @@
 
 **方式 A：GitHub Releases 附件**（推荐，随仓库分发）
 
-```markdown
-<video src="https://github.com/nil-is-lin/torus-grid-cutter/releases/download/v0.1.0/demo.mp4" controls width="720"></video>
-```
+[▶ 观看演示视频（15 MB）· v0.1.0](https://github.com/nil-is-lin/torus-grid-cutter/releases/download/v0.1.0/demo.mp4)
+
+> 注：GitHub README 出于安全策略会剥除 `<video>` 标签，内嵌播放不可用——
+> 点击上面链接浏览器直接播放，或下载后在本地播放器打开。
+> 如需 README 内自动播放的预览图，可再录一段 GIF 放 `assets/demo.gif`，
+> 在 README 头部加 `![演示](assets/demo.gif)`。
 
 **方式 B：外部平台链接**
 
