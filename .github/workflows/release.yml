@@ -29,21 +29,38 @@ jobs:
       - name: Install Rust (stable)
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Install Linux system deps (wgpu/egui GUI)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxkbcommon-dev libx11-dev libwayland-dev libxrandr-dev libxi-dev libvulkan-dev
+
       - name: Build release binary
         run: cargo build --release --verbose
 
-      - name: Rename artifact (Windows)
-        if: runner.os == 'Windows'
-        shell: cmd
-        run: move target\release\torus_grid_cutter.exe torus_grid_cutter-windows.exe
+      - name: List build output (diagnostics)
+        shell: bash
+        run: |
+          echo "=== target/release ==="
+          ls -la target/release
+          echo "=== binary present? ==="
+          ls target/release/torus_grid_cutter* 2>/dev/null || echo "BINARY MISSING"
 
-      - name: Rename artifact (Linux)
-        if: runner.os == 'Linux'
-        run: mv target/release/torus_grid_cutter torus_grid_cutter-linux
-
-      - name: Rename artifact (macOS)
-        if: runner.os == 'macOS'
-        run: mv target/release/torus_grid_cutter torus_grid_cutter-macos
+      - name: Rename artifact
+        shell: bash
+        run: |
+          shopt -s nullglob
+          if [ -f target/release/torus_grid_cutter.exe ]; then
+            mv target/release/torus_grid_cutter.exe torus_grid_cutter-windows.exe
+          fi
+          if [ -f target/release/torus_grid_cutter ]; then
+            case "${{ runner.os }}" in
+              Linux)  mv target/release/torus_grid_cutter torus_grid_cutter-linux ;;
+              macOS) mv target/release/torus_grid_cutter torus_grid_cutter-macos ;;
+            esac
+          fi
+          echo "=== renamed artifacts ==="
+          ls -la torus_grid_cutter-* 2>/dev/null || { echo "!! no artifact produced"; exit 1; }
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
