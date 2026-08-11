@@ -40,11 +40,12 @@ jobs:
 
       - name: List build output (diagnostics)
         shell: bash
+        continue-on-error: true
         run: |
           echo "=== target/release ==="
           ls -la target/release
-          echo "=== target/release/deps ==="
-          ls -la target/release/deps | head -40
+          echo "=== target/release/deps (torus_grid_cutter*) ==="
+          ls -la target/release/deps/torus_grid_cutter* 2>/dev/null || echo "no torus_grid_cutter* in deps"
 
       - name: Rename artifact
         shell: bash
