@@ -1,0 +1,331 @@
+\documentclass[12pt,a4paper]{article}
+\usepackage[UTF8]{ctex}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{geometry}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{listings}
+\usepackage{xcolor}
+
+\geometry{margin=2.5cm}
+\lstset{
+  basicstyle=\ttfamily\small,
+  keywordstyle=\color{blue},
+  commentstyle=\color{gray},
+  numbers=left,
+  numberstyle=\tiny,
+  frame=single,
+  breaklines=true,
+  morekeywords={pub, fn, let, mut, for, in, if, else, use, mod, struct, impl, self, Self, true, false, return, match, loop, while, break, continue, move, ref, const, static, type, trait, where, as, extern, crate, super, unsafe, dyn, async, await, f64, f32, Vec3, Vec2},
+  sensitive=true,
+  morecomment=[l]{//},
+  morecomment=[s]{/*}{*/},
+  morestring=[b]",
+}
+
+\title{Torus网格生成模块：torus.rs 实现详解}
+\author{}
+\date{\today}
+
+\begin{document}
+
+\maketitle
+
+\tableofcontents
+
+% ======================================================================
+\section{概述}
+% ======================================================================
+
+\texttt{torus.rs} 模块实现了 Torus（环面/甜甜圈面）的参数化网格生成功能。该模块提供从数学参数方程计算 Torus 表面任意点三维坐标的核心工具，是当前 Torus 切割项目的基础几何生成器。
+
+模块对外提供的真实接口（其余函数为内部实现细节）：
+
+\begin{itemize}
+\item \texttt{torus\_position(u, v, major\_r, minor\_r)}：标准轴对齐坐标系下，由参数 $(u,v)$ 计算 Torus 表面三维坐标。
+\item \texttt{torus\_position\_frame(u, v, major\_r, minor\_r, center, axis, u\_axis, v\_axis)}：在任意坐标系（中心/轴线/两套面内基轴）下计算三维坐标，与 \texttt{SurfaceModel::Torus} 及 knot 解析曲线共用同一坐标框架。
+\item \texttt{unfold\_position(u, v, major\_r, minor\_r)}：将 $(u,v)$ 展开为平面直角坐标（UV 平面视图）。
+\item \texttt{generate\_unfolded\_quad\_mesh(major\_r, minor\_r, res\_u, res\_v)}：直接由参数方程生成展开的四边形网格（顶点 + UV + 四边形索引），不依赖已有网格，也不生成跨越接缝的回绕面片。
+\end{itemize}
+
+注意：本模块\textbf{不}提供 \texttt{torus\_normal}、\texttt{generate\_torus\_mesh}、\texttt{generate\_torus\_mesh\_vertices} 等函数；法向量在渲染阶段由半边网格现算（平面法或顶点法线），而不是在几何生成阶段预存。
+
+% ======================================================================
+\section{数学基础}
+% ======================================================================
+
+\subsection{Torus 的参数方程}
+
+Torus 由两个参数定义：
+\begin{itemize}
+\item \textbf{大半径} $R$（major radius）：从 Torus 中心到管道中心的距离
+\item \textbf{小半径} $r$（minor radius）：管道的半径
+\end{itemize}
+
+Torus 的标准参数方程为：
+
+\begin{equation}
+\begin{aligned}
+x(u,v) &= (R + r\cos v)\cos u \\
+y(u,v) &= (R + r\cos v)\sin u \\
+z(u,v) &= r\sin v
+\end{aligned}
+\label{eq:torus-param}
+\end{equation}
+
+其中：
+\begin{itemize}
+\item $u \in [0, 2\pi)$：绕大圆的角度参数（环向角）
+\item $v \in [0, 2\pi)$：绕管道的角度参数（管向角）
+\end{itemize}
+
+轴线为 $z$ 轴，管道截面始终位于 $xy$ 平面内以 $(R\cos u, R\sin u, 0)$ 为圆心的圆上。
+
+\subsection{几何直观}
+
+可以将 Torus 的形成过程理解为：
+\begin{enumerate}
+\item 在 $xy$ 平面上，以 $(R, 0, 0)$ 为圆心、$r$ 为半径画一个圆（管道截面）
+\item 将这个圆绕 $z$ 轴旋转一周（$u$ 从 $0$ 到 $2\pi$）
+\end{enumerate}
+
+参数 $v$ 控制管道截面上的位置，参数 $u$ 控制管道绕 $z$ 轴的旋转角度。
+
+\subsection{解析法向量}
+
+Torus 表面上点 $(u,v)$ 处的外法向量由偏导叉积给出（详见 \texttt{surface.rs} 的几何推导，此处仅给出结论）：
+
+\begin{equation}
+\mathbf{n}(u,v) \propto (\cos v\cos u,\; \cos v\sin u,\; \sin v)
+\label{eq:torus-normal}
+\end{equation}
+
+该向量指向 Torus 外侧，仅与角度参数有关、与半径无关。实际渲染时统一在 \texttt{app.rs} 的 \texttt{rebuild\_render\_state} 中按面或按顶点计算，不在 \texttt{torus.rs} 内单独实现。
+
+% ======================================================================
+\section{核心函数实现}
+% ======================================================================
+
+\subsection{torus\_position：标准坐标系下的位置计算}
+
+\begin{lstlisting}[]
+pub fn torus_position(u: f64, v: f64, major_r: f64, minor_r: f64) -> Vec3 {
+    let cu = u.cos();
+    let su = u.sin();
+    let cv = v.cos();
+    let sv = v.sin();
+    let rr = major_r + minor_r * cv;
+    Vec3::new(
+        rr as f32 * cu as f32,
+        rr as f32 * su as f32,
+        minor_r as f32 * sv as f32,
+    )
+}
+\end{lstlisting}
+
+\textbf{实现细节}：
+\begin{itemize}
+\item 使用三角函数的局部变量（$\cos u$, $\sin u$, $\cos v$, $\sin v$）避免重复计算
+\item 中间变量 $rr = R + r\cos v$ 表示当前管道截面圆心到 $z$ 轴的距离
+\item 计算在 \texttt{f64} 精度下进行，最后转换为 \texttt{f32} 以匹配 GPU 渲染需求
+\end{itemize}
+
+\textbf{数学对应}：直接实现公式~\eqref{eq:torus-param}，与轴线为 $z$ 轴、面内基轴为 $(1,0,0)$ 与 $(0,1,0)$ 的标准 \texttt{SurfaceModel::torus\_from\_params} 一致。
+
+\subsection{torus\_position\_frame：任意坐标系下的位置计算}
+
+\begin{lstlisting}[]
+pub fn torus_position_frame(
+    u: f64, v: f64, major_r: f64, minor_r: f64,
+    center: Vec3, axis: Vec3, u_axis: Vec3, v_axis: Vec3,
+) -> Vec3 {
+    let cu = u.cos();
+    let su = u.sin();
+    let cv = v.cos();
+    let sv = v.sin();
+    let rr = major_r + minor_r * cv;
+    let x = rr * cu;
+    let y = rr * su;
+    let z = minor_r * sv;
+    center + u_axis * x as f32 + v_axis * y as f32 + axis * z as f32
+}
+\end{lstlisting}
+
+\textbf{设计动机}：当导入 OBJ 网格并拟合出任意姿态的 Torus（中心 \texttt{center}、轴线 \texttt{axis}、面内基轴 \texttt{u\_axis}/\texttt{v\_axis}）时，由参数方程生成的网格顶点必须与 knot 解析曲线（\texttt{SurfaceModel::generate\_torus\_knot\_line}）落在\textbf{同一个三维坐标框架}内，否则切割线与网格会错位。\texttt{torus\_position\_frame} 与 \texttt{generate\_torus\_knot\_line} 共用相同的 \texttt{center/axis/u\_axis/v\_axis} 映射，保证两者坐标一致。
+
+\subsection{unfold\_position：平面展开坐标}
+
+\begin{lstlisting}[]
+/// 将环面体的极坐标 (u, v) 展开为平面直角坐标。
+/// x = u * R（沿大圆的弧长），y = v * r（沿小圆的弧长），z = 0
+pub fn unfold_position(u: f64, v: f64, major_r: f64, minor_r: f64) -> Vec3 {
+    Vec3::new((u * major_r) as f32, (v * minor_r) as f32, 0.0)
+}
+\end{lstlisting}
+
+\textbf{用途}：UV 平面视图（\texttt{ViewMode::Unfolded}）下，把每个顶点的 $(u,v)$ 参数直接映射为平面直角坐标 $(x,y,z)=(uR, vr, 0)$，用于在平面上查看/编辑切割结果。在 \texttt{app.rs} 的 \texttt{to\_view\_mesh} / \texttt{rebuild\_render\_state} 中被调用。
+
+\subsection{generate\_unfolded\_quad\_mesh：展开四边形网格生成}
+
+\begin{lstlisting}[]
+pub fn generate_unfolded_quad_mesh(
+    major_r: f64, minor_r: f64, res_u: usize, res_v: usize,
+) -> (Vec<Vec3>, Vec<Vec2>, Vec<QuadIndex>) {
+    // res_u+1 x res_v+1 顶点：同时包含 u=0 与 u=2π（v 同理）
+    // 这两组顶点在 UV 上是独立的，但 3D 坐标相同。
+    let nu = res_u + 1;
+    let nv = res_v + 1;
+    let mut positions = Vec::with_capacity(nu * nv);
+    let mut uvs = Vec::with_capacity(nu * nv);
+    for i in 0..nu {
+        let u = 2.0 * PI * i as f64 / res_u as f64;
+        for j in 0..nv {
+            let v = 2.0 * PI * j as f64 / res_v as f64;
+            let pos = torus_position(u, v, major_r, minor_r);
+            positions.push(pos);
+            uvs.push(Vec2::new(u as f32, v as f32));
+        }
+    }
+    // 四边形：绝不回绕——只连接相邻列与相邻行
+    let mut quads = Vec::with_capacity(res_u * res_v);
+    for i in 0..res_u {
+        for j in 0..res_v {
+            let v00 = i * nv + j;
+            let v10 = (i + 1) * nv + j;
+            let v11 = (i + 1) * nv + (j + 1);
+            let v01 = i * nv + (j + 1);
+            quads.push((v00, v10, v11, v01));
+        }
+    }
+    (positions, uvs, quads)
+}
+\end{lstlisting}
+
+\textbf{关键事实}（纠正旧文档）：
+\begin{itemize}
+\item 顶点总数为 \textbf{$(res\_u+1) \times (res\_v+1)$}，\textbf{不是} $res\_u \times res\_v$。
+\item 这是因为网格同时包含参数域两端 $u=0$ 与 $u=2\pi$（以及 $v=0$ 与 $v=2\pi$）的顶点：它们在 UV 空间是独立顶点（便于展开平面视图的左/右、上/下边界各自独立），但对应同一个 3D 位置。
+\item 四边形总数为 $res\_u \times res\_v$。
+\item 索引计算：顶点 $(i,j)$ 的线性索引为 $i \times (res\_v+1) + j$。
+\item \textbf{不生成跨越接缝的四边形}：循环仅遍历 $i \in [0, res\_u)$、$j \in [0, res\_v)$，因此不会出现 $u=2\pi \to 0$ 或 $v=2\pi \to 0$ 的回绕面片；接缝处由两端各自的独立顶点承载。
+\end{itemize}
+
+\subsection{四边形索引顺序}
+
+每个参数空间四边形 $\{(i,j), (i+1,j), (i+1,j+1), (i,j+1)\}$ 的顶点按
+\begin{equation}
+(v_{00}, v_{10}, v_{11}, v_{01})
+\end{equation}
+排列，其中 $v_{00}=i\cdot nv+j$、$v_{10}=(i+1)\cdot nv+j$、$v_{11}=(i+1)\cdot nv+(j+1)$、$v_{01}=i\cdot nv+(j+1)$。该顺序保持逆时针绕向，配合 \texttt{HalfEdgeMesh::from\_quads} 构造流形网格。
+
+% ======================================================================
+\section{数据结构}
+% ======================================================================
+
+\subsection{输出三元组}
+
+\texttt{generate\_unfolded\_quad\_mesh} 返回：
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lll}
+\hline
+分量 & 类型 & 含义 \\
+\hline
+\texttt{positions} & \texttt{Vec<Vec3>} & 三维坐标，长度 $(res\_u+1)(res\_v+1)$ \\
+\texttt{uvs}       & \texttt{Vec<Vec2>} & 参数坐标 $(u,v)$，与 \texttt{positions} 一一对应 \\
+\texttt{quads}     & \texttt{Vec<QuadIndex>} & 四边形顶点索引四元组，长度 $res\_u\cdot res\_v$ \\
+\hline
+\end{tabular}
+\caption{generate\_unfolded\_quad\_mesh 输出}
+\end{table}
+
+\subsection{下游构造}
+
+\begin{itemize}
+\item Quad 模式（默认）：\texttt{HalfEdgeMesh::from\_quads(\&positions, \&uvs, \&quads)} 直接构造半边网格（见 \texttt{half\_edge.rs}）。
+\item Delaunay 模式：由 \texttt{delaunay::generate\_delaunay\_mesh} 生成三角形，再用 \texttt{HalfEdgeMesh::from\_triangles(\&positions, \&uvs, \&triangles)} 构造。
+\item OBJ 导入：由 \texttt{obj\_loader::load\_obj\_as\_half\_edge} 直接得到半边网格。
+\end{itemize}
+
+% ======================================================================
+\section{测试验证}
+% ======================================================================
+
+模块包含三个单元测试（纠正旧文档：不存在 \texttt{test\_torus\_vertex\_count} / \texttt{test\_torus\_positions\_on\_surface}）。
+
+\subsection{test\_torus\_periodicity}
+
+验证环面 $u/v$ 均以 $2\pi$ 为周期：
+\begin{lstlisting}[]
+#[test]
+fn test_torus_periodicity() {
+    let (major, minor) = (2.0, 0.5);
+    let (u, v) = (1.2, 2.4);
+    let p = torus_position(u, v, major, minor);
+    assert!(torus_position(u + 2.0*PI, v, major, minor).distance(p) < 1e-5);
+    assert!(torus_position(u, v + 2.0*PI, major, minor).distance(p) < 1e-5);
+}
+\end{lstlisting}
+即 \texttt{torus\_position(u+2\pi, v) == torus\_position(u, v)}，符合周期性。
+
+\subsection{test\_torus\_geometry}
+
+验证几何性质：$v=0$ 时点在最外侧（距中心 $=R+r$）；$u=0, v=\pi/2$ 时管顶在 $+z$（$z=r$，主圆半径 $=R$）；$v=\pi$ 时在内圈（距中心 $=R-r$）。
+
+\subsection{test\_unfold\_matches\_3d}
+
+验证 \texttt{unfold\_position} 与 \texttt{torus\_position} 共用同一 $(u,v)$ 参数域：展开坐标 $x=uR,\; y=vr$ 与输入一致，且 3D 位置有限、可计算。
+
+% ======================================================================
+\section{与其他模块的关系}
+% ======================================================================
+
+\begin{figure}[h]
+\centering
+\begin{verbatim}
+torus.rs
+   |
+   +-- generate_unfolded_quad_mesh()  --(positions, uvs, quads)-->
+   |        (Quad 模式)
+   |
+   +-- delaunay::generate_delaunay_mesh()  --(positions, uvs, tris)--  (Delaunay 模式)
+   |
+   +-- obj_loader::load_obj_as_half_edge()                (OBJ 模式)
+   |
+   v
+HalfEdgeMesh (from_quads / from_triangles)
+   |
+   v
+cut.rs (网格切割：cut_mesh_by_grid / cut_mesh_by_knots)
+   |
+   v
+color_scheme.rs (补片着色) + render/ (wgpu 渲染) + export/ (OBJ/STL/PLY 导出)
+\end{verbatim}
+\caption{torus.rs 在项目中的位置}
+\end{figure}
+
+\texttt{torus.rs} 是整个切割流程的几何起点：
+\begin{enumerate}
+\item 生成初始 Torus 网格（Quad / Delaunay / OBJ 三源之一）
+\item 转换为半边数据结构进行拓扑管理
+\item 切割算法基于参数坐标 $(u,v)$ 执行
+\item 最终结果渲染并导出
+\end{enumerate}
+
+% ======================================================================
+\section{总结}
+% ======================================================================
+
+\texttt{torus.rs} 模块提供了 Torus 网格生成的完整实现，具有以下特点：
+
+\begin{enumerate}
+\item \textbf{数学正确性}：严格遵循 Torus 参数方程；\texttt{torus\_position\_frame} 支持任意姿态以适配 OBJ 拟合结果。
+\item \textbf{展开网格的边界处理}：顶点数取 $(res\_u+1)\times(res\_v+1)$，显式保留接缝两端顶点，且不生成回绕四边形，保证 UV 平面视图与 3D 视图一致。
+\item \textbf{参数化支持}：保留 $(u,v)$ 坐标，为后续切割与着色提供基础。
+\item \textbf{可测试性}：包含周期性、几何正确性、展开映射三类单元测试。
+\end{enumerate}
+
+该模块是整个 Torus 切割项目的几何基础，其正确性和效率直接影响后续的切割和渲染效果。
+
+\end{document}

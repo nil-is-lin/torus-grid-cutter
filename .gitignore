@@ -1,0 +1,16 @@
+/target
+*.obj
+*.off
+/patches
+
+# LaTeX 中间产物（doc/ 只跟踪 .tex/.pdf）
+doc/*.aux
+doc/*.log
+doc/*.out
+doc/*.toc
+
+# 个人工具配置
+.claude/
+.trae/
+.reasonix/
+.workbuddy/

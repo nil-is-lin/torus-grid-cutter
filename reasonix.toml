@@ -1,0 +1,2 @@
+[permissions]
+allow = ["Bash=cd /d/CAD && grep -n \"MeshType::Delaunay\" src/app.rs | head -6 && sed -n \"$(grep -n 'MeshType::Delaunay =>' src/app.rs | head -1 | cut -d: -f1),+20p\" src/app.rs", "Bash=cd /d/CAD && sed -n '276,310p' src/app.rs && grep -n \"reapply_cuts\\|cut_mesh_by_grid\" src/app.rs | head -6"]

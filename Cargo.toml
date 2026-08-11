@@ -1,0 +1,28 @@
+[package]
+name = "torus-grid-cutter"
+version = "0.1.0"
+edition = "2021"
+description = "Torus mesh cutting and UV unwrapping tool: quad/Delaunay mesh generation, U/V-grid and torus-knot cutting, per-patch shaders, UV plane view, OBJ export"
+license = "MIT"
+readme = "README.md"
+keywords = ["mesh", "torus", "uv-unwrapping", "wgpu", "egui"]
+categories = ["graphics", "mathematics", "visualization"]
+authors = ["nil-is-lin"]
+
+[dependencies]
+winit = "0.30"
+wgpu = "24"
+egui = "0.31"
+egui-wgpu = "0.31"
+egui-winit = "0.31"
+glam = { version = "0.29", features = ["bytemuck"] }
+bytemuck = { version = "1", features = ["derive"] }
+log = "0.4"
+env_logger = "0.11"
+thiserror = "2"
+pollster = "0.4"
+delaunator = "1.1.0"
+rfd = "0.17.2"
+
+[profile.release]
+opt-level = 2

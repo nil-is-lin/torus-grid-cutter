@@ -1,0 +1,374 @@
+\documentclass[12pt,a4paper]{article}
+\usepackage[UTF8]{ctex}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{algorithm2e}
+\usepackage{geometry}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{cite}
+
+\geometry{margin=2.5cm}
+\lstset{
+  basicstyle=\ttfamily\small,
+  keywordstyle=\color{blue},
+  commentstyle=\color{gray},
+  numbers=left,
+  numberstyle=\tiny,
+  frame=single,
+  breaklines=true,
+}
+
+\title{Torus网格切割项目：算法实现详解（现行版本）}
+\author{}
+\date{\today}
+
+\begin{document}
+
+\maketitle
+
+\tableofcontents
+
+% ======================================================================
+\section{概述}
+% ======================================================================
+
+本项目实现了一个交互式三维 Torus（环面）网格切割工具。支持三种网格来源：
+\begin{itemize}
+\item \textbf{Quad 网格}（默认）：由 \texttt{torus::generate\_unfolded\_quad\_mesh} 直接生成的规则四边形网格；
+\item \textbf{Delaunay 网格}：泊松盘采样 + 周期 Delaunay 三角化（\texttt{delaunay::generate\_delaunay\_mesh}）；
+\item \textbf{OBJ 导入}：由 \texttt{obj\_loader::load\_obj\_as\_half\_edge} 解析外部网格。
+\end{itemize}
+
+在其表面生成参数化切割曲线（U/V 网格线 或 Torus Knot 曲线），沿曲线把每个面切开，得到若干独立的小模型（patch），以不同颜色渲染，并支持导出为 \textbf{OBJ / STL / PLY} 三种格式。
+
+核心技术挑战在于半边数据结构（Half-Edge / DCEL）上的切割操作，需要处理大量边界情况和数值鲁棒性问题。
+
+\textbf{与旧文档的要点差异}（已在正文中逐节纠正）：
+\begin{itemize}
+\item 导出格式为 \textbf{OBJ / STL / PLY}，\textbf{没有} OFF 导出；
+\item 相交检测用 \texttt{normalize\_uv} + \texttt{unwrap\_angle} 展开 UV，\textbf{不是}“枚举 5 个 du 偏移”；
+\item patch 编号用 \texttt{circular\_centroid} + \texttt{find\_region\_index}（对排序后的切割值二分查找），\textbf{不是} $\lfloor\bar u/w\rfloor\bmod N$；
+\item “在 knot 线上”的容差为 \texttt{MERGE\_EPS = 1e-4}，\textbf{不是} $10^{-8}$；
+\item \texttt{cut\_mesh\_by\_grid} 采用 U/V 交替迭代直到面数稳定（通常 2–3 轮），并有 \texttt{MAX\_FACES=150000} 硬上限保护。
+\end{itemize}
+
+% ======================================================================
+\section{Torus 参数化生成}
+% ======================================================================
+
+\subsection{数学公式}
+
+Torus 的参数方程由大半径 $R$（环心到管心的距离）和小半径 $r$（管道半径）定义：
+
+\begin{equation}
+\begin{aligned}
+x(u,v) &= (R + r\cos v)\cos u \\
+y(u,v) &= (R + r\cos v)\sin u \\
+z(u,v) &= r\sin v
+\end{aligned}
+\end{equation}
+
+其中 $u \in [0, 2\pi)$ 为绕大圆的参数角，$v \in [0, 2\pi)$ 为绕管道的参数角。详见 \texttt{torus.rs}（\texttt{torus.tex}）。
+
+\subsection{三种网格来源}
+
+\begin{itemize}
+\item \textbf{Quad}：\texttt{generate\_unfolded\_quad\_mesh(R, r, res\_u, res\_v)} 返回
+  $(res\_u+1)\times(res\_v+1)$ 个顶点与 $res\_u\times res\_v$ 个四边形（不去回绕）。
+  \texttt{HalfEdgeMesh::from\_quads} 构造半边网格。
+\item \textbf{Delaunay}：\texttt{generate\_delaunay\_mesh(R, r, n\_points, seed)} 返回
+  全三角形网格；拓扑（UV/三角形/半边）与 $R,r$ 无关，拖动 $R,r$ 时只重映射
+  顶点 3D 位置（\texttt{torus\_position}），故 UI 中缓存 \texttt{delaunay\_base}
+  以降低 rebuild 延迟。\texttt{HalfEdgeMesh::from\_triangles} 构造。
+\item \textbf{OBJ}：\texttt{load\_obj\_as\_half\_edge(path)} 解析 \texttt{v/vt/f}，
+  多边形 fan 三角化，按 $(pos,uv)$ 去重；若 OBJ 带 UV 且拟合为 Torus，则
+  \texttt{remap\_uvs\_from\_analytical\_model} 用 \texttt{SurfaceModel::compute\_uv}
+  重写每点 UV，使切割在一致参数域上进行。
+\end{itemize}
+
+默认 \texttt{resolution\_u=40, resolution\_v=24}（Quad），Delaunay 默认
+\texttt{delaunay\_points=500}，均可在 UI 中调整——参数化分辨率由用户配置决定，
+\textbf{不是}固定的 $41\times25$（旧文档数字已过时）。
+
+% ======================================================================
+\section{半边数据结构 (Half-Edge / DCEL)}
+% ======================================================================
+
+半边数据结构是网格切割操作的基础。每一个无向边被拆分为两条方向相反的半边（half-edge），每条半边属于一个面（face），并指向下一条半边（next）、上一条半边（prev）以及反向的孪生半边（twin）。
+
+\subsection{核心数据结构}
+
+\begin{lstlisting}[]
+pub struct HEVertex {
+    pub position: Vec3,    // 三维位置
+    pub uv: Vec2,          // 参数坐标 (u, v)
+    pub outgoing: HalfEdgeId, // 从该顶点出发的一条半边
+}
+
+pub struct HalfEdge {
+    pub origin: VertexId,  // 起始顶点
+    pub twin: HalfEdgeId,  // 反向半边（无向边的另一半）
+    pub next: HalfEdgeId,  // 沿面逆时针的下一条半边
+    pub prev: HalfEdgeId,  // 沿面逆时针的上一条半边
+    pub face: FaceId,      // 所属面
+}
+
+pub struct HEFace {
+    pub half_edge: HalfEdgeId, // 该面的任意一条半边
+    pub valid: bool,           // 切割后是否仍有效
+    pub patch_index: Option<(usize, usize)>, // 所属patch编号
+}
+\end{lstlisting}
+
+\subsection{从三角形 / 四边形构造半边网格}
+
+给定顶点位置数组、UV 数组和三角形索引三元组（或四边形索引四元组），构造过程如下：
+\begin{enumerate}
+\item 为每个面创建相应的半边。
+\item 为每个顶点记录一条出射半边。
+\item 利用哈希表 $(v_a, v_b)$（$v_a < v_b$）查找并配对孪生半边。
+\end{enumerate}
+\texttt{from\_triangles} 用于 Delaunay/OBJ，\texttt{from\_quads} 用于 Quad。
+
+\subsection{关键操作}
+
+\subsubsection{split\_edge}
+
+在一条半边上插入一个新顶点 $V_{\text{new}}$，将原半边及其孪生分别拆分为两段，并更新 next/prev/twin/origin/face 等指针。
+
+\subsubsection{split\_face}
+
+在面的边界上两个顶点 $v_a$ 和 $v_b$ 之间添加一条对角线，将一个面拆分为两个：创建对角线半边及其反向半边，重连周围的 next/prev 指针，重新分配两个面的 face 归属。
+
+% ======================================================================
+\section{切割曲线定义}
+% ======================================================================
+
+\subsection{U/V 网格线}
+
+U-常值线：$u = \mathrm{const}$，沿 $v$ 方向延伸；V-常值线：$v = \mathrm{const}$，沿 $u$ 方向延伸。它们的 UV 位置由 UI 的 loop 参数决定：
+\begin{itemize}
+\item \textbf{Quad 模式}：线位置吸附到最近的网格顶点线（$u = 2\pi\cdot k / res\_u$），使切割沿面边界走、不穿过面内部，从而保持四边形面型；
+\item \textbf{Delaunay/OBJ 模式}：取单元中心等分（$u = 2\pi\cdot(i+0.5)/n$），会穿过面内部，切割后由三角化保持全三角形。
+\end{itemize}
+
+\subsection{Torus Knot 曲线}
+
+Knot 曲线 $v = k\,u$ 在参数方域内有 $k$ 条分支（$v = k\,u + 2\pi n$）。支持两条 knot（$k_1, k_2$）独立开关。详见 \texttt{knot\_algorithm.tex}。
+
+\subsection{UV 域与周期性}
+
+环面在 $u$ 和 $v$ 方向周期 $2\pi$。网格生成时 $u=0$ 与 $u=2\pi$ 是独立顶点（不回绕），相交检测通过 \texttt{normalize\_uv}+\texttt{unwrap\_angle} 在局部展开，避免接缝误判。
+
+% ======================================================================
+\section{三角形/多边形与切割线的相交检测}
+% ======================================================================
+
+\subsection{UV 展开工具（核心）}
+
+相交检测不再用“枚举 5 个 du 偏移”，而是：
+\begin{enumerate}
+\item \texttt{normalize\_uv(val, min, max) = (val-min)/(max-min) * 2\pi}：把任意 UV 域 $[min,max]$ 归一化到 $[0,2\pi)$，使 \texttt{unwrap\_angle}（周期 $2\pi$）能正确工作。
+\item \texttt{unwrap\_angle(angle, reference)}：通过反复 $\pm 2\pi$ 使
+  \texttt{angle - reference} $\in [-\pi, \pi]$，得到相对参考点的连续坐标，正确处理接缝。
+\end{enumerate}
+
+\subsection{分类与交点（U-线为例）}
+
+\texttt{intersect\_face\_u(face\_verts, u\_const, uv\_range)}：
+\begin{enumerate}
+\item 对所有顶点，先 \texttt{normalize\_uv} 再 \texttt{unwrap\_angle}（相对首顶点）得到连续 $(a_i, b_i)$；对 $u\_const$ 同样处理得到 $uc\_unwrap$。
+\item 按 \texttt{diff = a\_i - uc\_unwrap} 分类：
+  \[
+  \mathrm{side}_i = \begin{cases}
+  \mathrm{OnLine} & |\mathrm{diff}| < \mathrm{MERGE\_EPS} \\
+  \mathrm{Less}   & \mathrm{diff} < 0 \\
+  \mathrm{Greater} & \mathrm{diff} > 0
+  \end{cases}
+  \]
+\item 若只有同侧（无 Less/Greater 且无 OnLine）→ 无交点；若既非两侧跨线又无 OnLine → 返回 None。
+\item 对每条边 $(i0,i1)$，跳过两端皆 OnLine、或两端同侧且无 OnLine 的边；\texttt{du = a[i1]-a[i0]}，若 $|\mathrm{du}|\le \mathrm{EPSILON}$ 跳过（平行于线）；
+  \[
+  t = (uc\_unwrap - a_{i0}) / \mathrm{du},\quad \text{夹到 }[0,1]
+  \]
+  并过滤起点 OnLine 且 $t<\mathrm{MERGE\_EPS}$、终点 OnLine 且 $t>1-\mathrm{MERGE\_EPS}$ 的情形。
+\item 交点 UV 由 \texttt{clamp\_uv} 夹回 $[0,2\pi]$，3D 坐标按边线性插值。
+\end{enumerate}
+\texttt{intersect\_face\_v} 完全对称（交换 $u\leftrightarrow v$）。
+
+\subsection{退化情况}
+
+\begin{itemize}
+\item 顶点在线上（$t\approx 0$ 或 $t\approx 1$）：加入 on\_line\_vertices。
+\item 边平行于线（$|\mathrm{du}|<\mathrm{EPSILON}$）：无交点。
+\item 整条边在线上（两端 OnLine）：不切。
+\item 接缝面：经 \texttt{unwrap\_angle} 展开后，短路径边不会被误判为跨过 $2\pi$。
+\end{itemize}
+
+% ======================================================================
+\section{网格切割算法}
+% ======================================================================
+
+\subsection{cut\_mesh\_by\_grid：U/V 交替收敛}
+
+\begin{algorithm}[H]
+\KwIn{半边网格 $M$，U 切割值集合 $U$，V 切割值集合 $V$，UV 域 $R$}
+\KwOut{切割后的网格 $M$，面保持原面型（Quad 保持四边形 / Delaunay 保持全三角形）}
+
+\For{最多 6 轮}{
+  记录切割前面数 $N_{before} \gets M.\text{num\_valid\_faces}()$\;
+  \For{每条 $u \in U$}{ \texttt{cut\_mesh\_by\_u\_line($M$, $u$, $R$)} }
+  \For{每条 $v \in V$}{ \texttt{cut\_mesh\_by\_v\_line($M$, $v$, $R$)} }
+  \If{$M.\text{num\_valid\_faces}() == N_{before}$}{ 跳出（已收敛） }
+  \If{$M.\text{num\_valid\_faces}() > 150000$}{ 记录警告并跳出（防指数增长） }
+}
+\If{\texttt{finalize\_triangles}}{ 把残留 $>3$ 边多边形 fan 三角化 }
+验证 $M.\text{validate}()$ 并打印最终面数/顶点数\;
+\end{algorithm}
+
+\textbf{为什么交替迭代}：一条切割线切出的新面可能仍跨另一条切割线（例如 U 线切完后，V 线切分产生的多边形仍可能跨 U 线），需反复执行全部切割线直到面数不再变化——通常 2–3 轮收敛。每轮实时检查面数变化即决定是否停止。
+
+\textbf{面型保持}：相交的非三角形面在切割处\textbf{局部三角化}（\texttt{cut\_face\_local}），其余面保持原面型——Quad 网格的四边形与 Knot 远处区域都不受影响。Delaunay 模式传入 \texttt{finalize\_triangles=true}，使切割后全为三角形（一条直线切三角形必产生四边形+三角形，靠收尾三角化消除残留多边形）。
+
+\subsection{为什么先 U 后 V（顺序无关性）}
+
+当前实现在一轮中依次处理全部 U 线再全部 V 线，但关键点在于“交替迭代直到收敛”：由于循环条件实时检查面数且重复整轮，最终结果与 U/V 处理的先后顺序无关，所有交叉都会被正确切开。
+
+% ======================================================================
+\section{patch 分配}
+% ======================================================================
+
+切割完成后，为每个有效面计算其参数质心并归属区域。\textbf{注意}：这里使用
+\texttt{circular\_centroid}（先相对首顶点 \texttt{unwrap}，再取算术均值，最后映射回
+$[min,max]$ 原 UV 空间），\textbf{不再}使用旧文档的“圆均值/算术均值之争”，也
+\textbf{不}用 $\lfloor\bar u/w\rfloor\bmod N$ 公式。
+
+\subsection{区域查找：\texttt{find\_region\_index}}
+
+将切割值排序后，用线性/二分查找确定质心落在第几段：
+\begin{lstlisting}[]
+fn find_region_index(value: f64, sorted_cuts: &[f64]) -> usize {
+    if sorted_cuts.is_empty() { return 0; }
+    if value < sorted_cuts[0] { return sorted_cuts.len() - 1; }
+    for i in 0..sorted_cuts.len()-1 {
+        if value < sorted_cuts[i+1] { return i; }
+    }
+    sorted_cuts.len() - 1
+}
+\end{lstlisting}
+
+\subsection{assign\_patch\_indices}
+
+\begin{enumerate}
+\item 对 $U/V$ 切割值分别排序，并用 \texttt{normalize\_uv} 归一化到 $[0,2\pi)$。
+\item 对每个有效面，\texttt{circular\_centroid} 得到 $(\bar u, \bar v)$，再归一化。
+\item $\mathrm{pu} = \texttt{find\_region\_index}(\bar u_{\text{norm}}, sorted\_u)$，
+  $\mathrm{pv} = \texttt{find\_region\_index}(\bar v_{\text{norm}}, sorted\_v)$。
+\item 写入 \texttt{face.patch\_index = Some((pu, pv))}。
+\end{enumerate}
+
+周期语义：$n$ 条切割线把环域分成 $n$ 段（值小于第一条线者归入最后一段），故
+\texttt{cut\_grid\_dims} 返回 $(n_u, n_v)$（无切割时为 $(1,1)$）。
+
+Knot 模式则使用 \texttt{assign\_multi\_knot\_patch\_indices}（见 \texttt{knot\_algorithm.tex}）。
+
+% ======================================================================
+\section{渲染管线}
+% ======================================================================
+
+\subsection{基于 wgpu 的渲染架构}
+
+\begin{enumerate}
+\item \textbf{Mesh Pass}：顶点着色器接收 position、normal、color、uv、material，经 MVP 变换后输出；片元着色器支持 42 种着色模式（PBR/Matcap/Toon/…），含方向光 + 环境光 + 三点光照。
+\item \textbf{Edge Pass}（线框/切割线）：把网格边与切割线作为彩色线段单独绘制，叠加在 Mesh Pass 之上。
+\item \textbf{egui Overlay Pass}：即时模式 GUI 在最上层绘制（浮于 3D 场景之上，不清屏）。
+\end{enumerate}
+所有 Pass 只渲染到中央 3D 视口区域（左右面板不被场景覆盖）。
+
+\subsection{摄像机}
+
+球坐标系轨道摄像机：
+\begin{equation}
+\text{eye} = \begin{pmatrix} \rho\cos\phi\cos\theta \\ \rho\sin\phi \\ \rho\cos\phi\sin\theta \end{pmatrix} + \text{target}
+\end{equation}
+$\theta$ 方位角（鼠标水平拖动），$\phi$ 极角（鼠标垂直拖动），$\rho$ 距离（滚轮）；WASD/QE 平移 target；左键旋转、右键/中键平移。
+
+% ======================================================================
+\section{数值鲁棒性}
+% ======================================================================
+
+\subsection{容差策略}
+
+\begin{itemize}
+\item \texttt{EPSILON = 1e-8}：用于“边是否平行于切割线”（$|\mathrm{du}|\le\mathrm{EPSILON}$ 即判定平行）以及交点参数 $t$ 的边界判定。
+\item \texttt{MERGE\_EPS = 1e-4}：用于“顶点是否在切割线上”的判定（$|\mathrm{diff}|<\mathrm{MERGE\_EPS}$ 即 OnLine），以及跳过与 OnLine 顶点重合的交点。因相邻边分裂产生的顶点经 unwrap+wrap 往返后 $\phi$ 可能略超 $10^{-8}$，故用更宽松的 $10^{-4}$。
+\item 插值参数 $t$ 统一夹到 $[0,1]$。
+\end{itemize}
+旧文档把 OnLine 容差写成 $10^{-8}$，与代码不符——实际是 \texttt{MERGE\_EPS=1e-4}。
+
+\subsection{环面拓扑的包裹处理}
+
+\begin{itemize}
+\item UV 经 \texttt{normalize\_uv} 归一化到 $[0,2\pi)$ 后再 \texttt{unwrap\_angle} 展开。
+\item 接缝处（$u\approx 0$ 或 $u\approx 2\pi$）的三角形通过相对首顶点的连续展开正确判定跨线。
+\item 交点 UV 用 \texttt{clamp\_uv} 夹回，不回绕。
+\end{itemize}
+
+% ======================================================================
+\section{文件导出}
+% ======================================================================
+
+\subsection{导出格式}
+
+当前版本支持三种格式（\texttt{ExportFormat} 枚举），\textbf{没有 OFF 导出}：
+
+\begin{lstlisting}[]
+pub enum ExportFormat { Obj, Stl, Ply }
+\end{lstlisting}
+
+\begin{itemize}
+\item \texttt{export\_mesh(mesh, path, format)}：按格式导出整张网格（所见即所得——UV 平面视图导出展开坐标，3D 视图导出环面坐标）。
+\item \texttt{export\_by\_patch(mesh, dir, format)}：按 patch 批量导出，每补片一个文件
+  \texttt{<dir>/patch\_<pu>\_<pv>.<ext>}。
+\end{itemize}
+
+\subsection{OBJ 格式（obj.rs）}
+
+按 patch 分组，使用 \texttt{g patch\_<pu>\_<pv>} 组标签：
+\begin{verbatim}
+g patch_0_0
+f v/vt//vn v/vt//vn v/vt//vn
+...
+g patch_0_1
+...
+\end{verbatim}
+顶点法向量通过相邻面法向量面积加权平均计算（\texttt{compute\_vertex\_normals}）。
+
+\subsection{STL 格式（stl.rs）}
+
+ASCII STL，每面写法向量（右手定则）与三个顶点，包裹在
+\texttt{solid torus\_grid\_cutter} / \texttt{endsolid} 之间。
+
+\subsection{PLY 格式（ply.rs）}
+
+ASCII PLY，头部声明 \texttt{element vertex} / \texttt{element face}，每面写
+\texttt{3 i0 i1 i2}。
+
+% ======================================================================
+\section{总结}
+% ======================================================================
+
+本项目的核心难点在于半边数据结构上的切割操作。关键要点：
+
+\begin{enumerate}
+\item \textbf{半边数据结构的精确操作}：split\_edge 和 split\_face 需要更新多个指针字段，任何一个错误都会导致网格拓扑损坏。
+\item \textbf{UV 展开驱动相交}：用 \texttt{normalize\_uv}+\texttt{unwrap\_angle} 在局部连续展开，正确处理环面周期性与接缝，比旧“枚举多路径 du”更稳健。
+\item \textbf{U/V 交替收敛}：反复整轮切割直到面数稳定，保证所有交叉被切开；\texttt{MAX\_FACES=150000} 上限防止极端参数下指数增长。
+\item \textbf{面型保持}：切割处局部三角化，Quad 四边形与 Knot 远处面不受影响。
+\item \textbf{数值鲁棒性}：\texttt{EPSILON=1e-8} 判平行，\texttt{MERGE\_EPS=1e-4} 判在线上，覆盖顶点在线上、边近似平行、交点贴近顶点等退化情形。
+\item \textbf{导出 OBJ/STL/PLY}：按 patch 分组，所见即所得。
+\end{enumerate}
+
+\end{document}
