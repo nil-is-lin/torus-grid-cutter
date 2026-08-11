@@ -57,7 +57,12 @@ pub fn build_objfile_mesh(
         report("Remapping UVs", paths.len(), paths.len());
         remap_uvs(&mut mesh, &model);
         // 解析环面重映射后 UV 落在 [0, 2π)，与程序生成网格保持一致
-        uv_range = (0.0, 2.0 * std::f64::consts::PI, 0.0, 2.0 * std::f64::consts::PI);
+        uv_range = (
+            0.0,
+            2.0 * std::f64::consts::PI,
+            0.0,
+            2.0 * std::f64::consts::PI,
+        );
     }
 
     Ok(BuildOutput {

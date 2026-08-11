@@ -142,7 +142,11 @@ fn spawn_obj_dialog(tx: std::sync::mpsc::Sender<Option<Vec<String>>>) {
             .add_filter("All Files", &["*"])
             .set_title("Open OBJ Files")
             .pick_files();
-        files.map(|v| v.into_iter().map(|p| p.to_string_lossy().to_string()).collect())
+        files.map(|v| {
+            v.into_iter()
+                .map(|p| p.to_string_lossy().to_string())
+                .collect()
+        })
     };
     #[cfg(target_os = "windows")]
     {
@@ -544,7 +548,8 @@ impl App {
         self.torus_mesh = Some(out.mesh.clone());
         self.base_mesh = Some(out.mesh);
         let (nu, nv) = self.ui_state.cut_grid_dims();
-        self.patch_colors = color_scheme::generate_patch_colors(nu, nv, &self.ui_state.color_scheme);
+        self.patch_colors =
+            color_scheme::generate_patch_colors(nu, nv, &self.ui_state.color_scheme);
         self.reapply_cuts();
         self.rebuild_render_state();
     }
