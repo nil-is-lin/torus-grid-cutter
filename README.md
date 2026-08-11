@@ -18,11 +18,13 @@
 
 ## 演示视频
 
-> 演示视频随仓库分发：mp4 放在 `docs/demo.mp4`，通过 **GitHub Pages** 托管，
+![演示](assets/demo.gif)
+
+> 演示视频随仓库分发：完整版 mp4 放在 `docs/demo.mp4`，通过 **GitHub Pages** 托管，
 > 浏览器点击即可在线播放（不会强制下载）。需要在仓库
 > **Settings → Pages** 中将 Source 设为 `main` 分支的 `/docs` 目录。
 
-[▶ 观看演示视频（15 MB）](https://nil-is-lin.github.io/torus-grid-cutter/demo.mp4)
+[▶ 观看完整视频（15 MB）](https://nil-is-lin.github.io/torus-grid-cutter/demo.mp4)
 
 录制建议：窗口 1280×720，OBS / Windows Game Bar 均可；建议时长 1–3 分钟。
 上传步骤：将 `demo.mp4` 放入本仓库 `docs/` 目录并提交推送即可。
