@@ -1,0 +1,81 @@
+name: Release
+
+# 触发：推送 v* 标签，或手动在 Actions 页点 Run workflow
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '要发布的 tag（默认 v0.1.0）'
+        required: false
+        default: 'v0.1.0'
+
+permissions:
+  contents: write   # 需要创建 Release
+
+jobs:
+  build:
+    name: Build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build release binary
+        run: cargo build --release --verbose
+
+      - name: Rename artifact (Windows)
+        if: runner.os == 'Windows'
+        shell: cmd
+        run: move target\release\torus_grid_cutter.exe torus_grid_cutter-windows.exe
+
+      - name: Rename artifact (Linux)
+        if: runner.os != 'Windows'
+        run: mv target/release/torus_grid_cutter torus_grid_cutter-linux
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: torus-grid-cutter-${{ matrix.os }}
+          path: torus_grid_cutter-*
+
+  release:
+    name: Create GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Gather release assets
+        run: |
+          mkdir -p assets
+          cp artifacts/torus_grid_cutter-* assets/ 2>/dev/null || true
+          cp doc/*.pdf assets/
+          ls -lh assets/
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          # 手动触发时用输入值；tag 推送时自动用 tag 名
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          name: torus-grid-cutter ${{ github.event.inputs.tag || github.ref_name }}
+          generate_release_notes: true
+          files: assets/*
+          # 演示视频 demo.mp4 不进仓库，请在本 Release 页面手动拖入附件，
+          # 或在仓库里提交 demo.mp4 后把上面 files 改为 includes assets/* 与 demo.mp4。
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
