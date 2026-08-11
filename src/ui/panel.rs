@@ -274,7 +274,7 @@ impl Default for LightSettings {
 pub enum MeshType {
     Quad,
     Delaunay,
-    ObjFile(String),
+    ObjFile(Vec<String>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -439,6 +439,11 @@ pub struct UiState {
     pub active_tab: PanelTab,
     pub uv_range: (f64, f64, f64, f64),
     pub surface_model: crate::mesh::surface::SurfaceModel,
+
+    // 后台构建（OBJ 导入）状态——由 App 每帧镜像，状态栏常驻显示
+    pub is_building: bool,
+    pub build_status: String,
+    pub build_progress: f32,
 }
 
 impl Default for UiState {
@@ -521,6 +526,9 @@ impl Default for UiState {
                 2.0 * std::f64::consts::PI,
             ),
             surface_model: crate::mesh::surface::SurfaceModel::torus_from_params(2.0, 0.6),
+            is_building: false,
+            build_status: "Ready".to_string(),
+            build_progress: 0.0,
         }
     }
 }
@@ -628,6 +636,11 @@ impl UiState {
     /// 实际补片网格尺寸。Knot 模式的补片数由切割结果决定（max_pu+1，
     /// 以 patch_visible 长度为准），不能使用 cut_grid_dims 的硬编码 (4,1)。
     pub fn actual_patch_dims(&self) -> (usize, usize) {
+        // OBJ 多选导入：补片数 = 文件数（每个文件一个补片），不能使用
+        // cut_grid_dims 的硬编码 (4,1)，否则补片面板条目数与实际不符。
+        if let MeshType::ObjFile(paths) = &self.mesh_type {
+            return (paths.len().max(1), 1);
+        }
         let (mut nu, mut nv) = self.cut_grid_dims();
         if self.cut_mode == CutMode::Knot && self.patch_visible.len() > 1 {
             nu = self.patch_visible.len();
@@ -733,6 +746,25 @@ pub fn render_ui_panel(
             });
         });
     });
+
+    // 底部状态栏：后台构建进度常驻显示（即使面板隐藏也可见）
+    egui::TopBottomPanel::bottom("status_bar")
+        .resizable(false)
+        .show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                if ui_state.is_building {
+                    ui.spinner();
+                    ui.label(ui_state.build_status.as_str());
+                    ui.add(
+                        egui::ProgressBar::new(ui_state.build_progress.clamp(0.0, 1.0))
+                            .show_percentage(),
+                    );
+                } else {
+                    ui.colored_label(egui::Color32::from_rgb(80, 170, 90), "●");
+                    ui.label(ui_state.build_status.as_str());
+                }
+            });
+        });
 
     if !ui_state.show_properties {
         return action;
@@ -1240,8 +1272,11 @@ fn render_mesh_tab(ui: &mut egui::Ui, ui_state: &mut UiState, action: &mut UiAct
         {
             action.open_obj_dialog = true;
         }
-        if let MeshType::ObjFile(ref path) = ui_state.mesh_type {
-            ui.label(format!("     Loaded: {}", path));
+        if let MeshType::ObjFile(ref paths) = ui_state.mesh_type {
+            ui.label(format!("     Loaded {} OBJ file(s):", paths.len()));
+            for p in paths {
+                ui.label(format!("       • {}", p));
+            }
         }
         if ui_state.mesh_type != prev_type {
             action.rebuild = true;

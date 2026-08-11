@@ -41,9 +41,17 @@ impl HalfEdgeMesh {
         let is_closed = boundary_half_edges == 0;
         let euler = vertices as i64 - edges as i64 + faces as i64;
 
-        // 边界环数：沿边界走（绕顶点找下一条边界出边），统计闭合环
+        // 边界环数：沿边界走（绕顶点找下一条边界出边），统计闭合环。
+        //
+        // 注意：导入的 OBJ（尤其是 CAD 导出的 patch）可能是非流形拓扑——
+        // 某个边界顶点挂了 ≥2 条出边界半边、或 twin 链因 T 型连接而错配。
+        // 这类退化拓扑会让"沿边界走"陷入永不回到起点 `i` 的环，旧实现会
+        // 死循环导致主线程"未响应"。这里加两道护栏：
+        //   1) 外层：若下一步要走的半边已访问过，立即终止（打破环）；
+        //   2) 内层：绕顶点转圈的迭代次数封顶为半边数，避免错配 twin 造成的死循环。
         let mut visited = vec![false; self.half_edges.len()];
         let mut boundary_loops = 0usize;
+        let hlen = self.half_edges.len();
         for (i, he) in self.half_edges.iter().enumerate() {
             if he.twin.0 != usize::MAX || visited[i] {
                 continue;
@@ -56,6 +64,7 @@ impl HalfEdgeMesh {
                 let first = self.half_edges[cur].next;
                 let mut cand = first;
                 let mut found = None;
+                let mut inner_iter = 0usize;
                 loop {
                     if self.half_edges[cand.0].twin.0 == usize::MAX {
                         found = Some(cand);
@@ -66,10 +75,19 @@ impl HalfEdgeMesh {
                     if cand == first {
                         break;
                     }
+                    inner_iter += 1;
+                    if inner_iter > hlen {
+                        // 退化/坏拓扑：绕顶点循环未闭合，强制终止以免死循环
+                        break;
+                    }
                 }
                 let Some(nxt) = found else { break };
                 if nxt.0 == i {
                     break; // 回到起点，环闭合
+                }
+                if visited[nxt.0] {
+                    // 退化拓扑（非流形边界顶点）导致的环；停止以免死循环
+                    break;
                 }
                 cur = nxt.0;
             }
@@ -201,5 +219,30 @@ mod tests {
         assert!(mesh.validate());
         assert!(s.is_closed, "切割不应产生开放边界");
         assert_eq!(s.euler_characteristic, 0);
+    }
+
+    /// 回归测试：非流形 / 退化拓扑不应让 `compute_stats` 死循环。
+    ///
+    /// 旧实现的 `boundary_loops` 遍历缺少 `visited` 护栏，一旦边界顶点挂了
+    /// ≥2 条出边界半边（CAD 导出的 patch 常见），"沿边界走"会陷入永不回到
+    /// 起点的环，主线程卡死 → 窗口"未响应"。这里用一个会触发该拓扑的输入
+    /// 验证 `compute_stats` 能在有限步内返回。
+    #[test]
+    fn test_compute_stats_terminates_on_nonmanifold_boundary() {
+        // 三个三角形拼成"棒棒糖"拓扑：顶点 3 是非流形边界顶点（2 条出边界
+        // 半边），且 from_triangles 会为 (1,2) 这类同向边链出坏 twin。
+        let positions = vec![
+            glam::Vec3::new(0.0, 0.0, 0.0), // 0
+            glam::Vec3::new(1.0, 0.0, 0.0), // 1
+            glam::Vec3::new(1.0, 1.0, 0.0), // 2
+            glam::Vec3::new(0.0, 1.0, 0.0), // 3
+        ];
+        let uvs = vec![glam::Vec2::ZERO; 4];
+        let tris = vec![(0usize, 1, 2), (0usize, 2, 3), (1usize, 2, 3)];
+        let mesh = HalfEdgeMesh::from_triangles(&positions, &uvs, &tris);
+        // 若 compute_stats 死循环，本条测试会挂死（被 cargo test 超时捕获）。
+        let s = mesh.compute_stats();
+        // 非闭合网格应统计到若干边界半边。
+        assert!(s.boundary_half_edges > 0, "退化网格应存在边界半边");
     }
 }

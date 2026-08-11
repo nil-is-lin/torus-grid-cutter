@@ -108,6 +108,52 @@ pub struct App {
     // 每帧只渲染一次：render() 同时绘制两个窗口，由 RedrawRequested 驱动
     //（render 窗口优先；其被最小化/抑制时由 UI 窗口兜底）
     rendered_this_frame: bool,
+
+    // 后台构建（OBJ 导入）状态：worker 线程回报，主线程每帧轮询并镜像到 UI 状态栏
+    build_rx: Option<std::sync::mpsc::Receiver<BuildEvent>>,
+    is_building: bool,
+    build_status: String,
+    build_progress: f32,
+    // 文件对话框（OBJ 多选）在后台线程打开，主线程保持响应，避免 rfd 模态
+    // 对话框阻塞事件循环导致"未响应"。线程把结果通过此通道回传。
+    dialog_rx: Option<std::sync::mpsc::Receiver<Option<Vec<String>>>>,
+    // 网格统计缓存：仅在网格变化时重算（apply_build_output / build_torus_mesh /
+    // reapply_cuts），避免每帧 compute_stats 占用主线程。
+    cached_stats: Option<crate::mesh::stats::MeshStats>,
+}
+
+/// 后台 OBJ 构建线程回报的事件。
+enum BuildEvent {
+    Progress {
+        stage: String,
+        done: usize,
+        total: usize,
+    },
+    Done(crate::mesh::build::BuildOutput),
+    Error(String),
+}
+
+/// 在后台线程打开 rfd 文件对话框，避免阻塞主事件循环（Windows 下可跨线程调用；
+/// macOS/Linux 的 rfd 同步 API 必须在主线程调用，故回退为同步执行）。
+fn spawn_obj_dialog(tx: std::sync::mpsc::Sender<Option<Vec<String>>>) {
+    let run = || {
+        let files = rfd::FileDialog::new()
+            .add_filter("OBJ Files", &["obj"])
+            .add_filter("All Files", &["*"])
+            .set_title("Open OBJ Files")
+            .pick_files();
+        files.map(|v| v.into_iter().map(|p| p.to_string_lossy().to_string()).collect())
+    };
+    #[cfg(target_os = "windows")]
+    {
+        std::thread::spawn(move || {
+            let _ = tx.send(run());
+        });
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = tx.send(run());
+    }
 }
 
 impl App {
@@ -139,6 +185,12 @@ impl App {
             ui_state: UiState::default(),
             last_time: std::time::Instant::now(),
             rendered_this_frame: false,
+            build_rx: None,
+            is_building: false,
+            build_status: "Ready".to_string(),
+            build_progress: 0.0,
+            dialog_rx: None,
+            cached_stats: None,
         }
     }
 
@@ -282,13 +334,12 @@ impl App {
                 }
                 mesh
             }
-            MeshType::ObjFile(path) => match crate::mesh::obj_loader::load_obj_as_half_edge(path) {
-                Ok(m) => m,
-                Err(e) => {
-                    log::error!("Failed to load OBJ '{}': {}", path, e);
-                    return;
-                }
-            },
+            MeshType::ObjFile(_) => {
+                // OBJ 导入已改由后台 worker 线程构建（spawn_objfile_build），
+                // 同步路径不应再触发；若到达则跳过，避免重复构建/阻塞主线程。
+                log::warn!("build_torus_mesh 收到 ObjFile，但 OBJ 已由后台线程构建，跳过");
+                return;
+            }
         };
 
         match &self.ui_state.mesh_type {
@@ -367,9 +418,144 @@ impl App {
             color_scheme::generate_patch_colors(nu, nv, &self.ui_state.color_scheme);
         self.torus_mesh = Some(mesh.clone());
         self.base_mesh = Some(mesh);
+        self.cached_stats = self.torus_mesh.as_ref().map(|m| m.compute_stats());
+    }
+
+    /// 在后台线程构建 OBJ 导入网格，主线程保持响应。
+    fn spawn_objfile_build(&mut self) {
+        let paths = match &self.ui_state.mesh_type {
+            panel::MeshType::ObjFile(p) => p.clone(),
+            _ => return,
+        };
+        let major = self.ui_state.major_radius;
+        let minor = self.ui_state.minor_radius;
+        // 使用有界通道（容量 2）：worker 发送进度后若主线程未消费会短暂阻塞，
+        // 避免无界队列堆积，确保主线程始终能及时 pump Windows 消息、刷新 UI。
+        let (tx, rx) = std::sync::mpsc::sync_channel::<BuildEvent>(2);
+        self.build_rx = Some(rx);
+        self.is_building = true;
+        self.build_status = "Preparing…".to_string();
+        self.build_progress = 0.0;
+        std::thread::spawn(move || {
+            let mut report = |stage: &str, done: usize, total: usize| {
+                // try_send：若主线程暂时没消费，丢弃旧进度事件，worker 绝不阻塞。
+                let _ = tx.try_send(BuildEvent::Progress {
+                    stage: stage.to_string(),
+                    done,
+                    total,
+                });
+            };
+            match crate::mesh::build::build_objfile_mesh(&paths, major, minor, &mut report) {
+                Ok(out) => {
+                    let _ = tx.send(BuildEvent::Done(out));
+                }
+                Err(e) => {
+                    let _ = tx.send(BuildEvent::Error(e));
+                }
+            }
+        });
+    }
+
+    /// 每帧轮询后台线程（非阻塞），把进度/结果同步到 App 状态。
+    fn poll_build_worker(&mut self) {
+        let rx = match self.build_rx.take() {
+            Some(rx) => rx,
+            None => return,
+        };
+        let mut finished = false;
+        // 每帧最多处理 8 个事件，避免 worker 瞬间产生大量进度时单帧卡死。
+        for _ in 0..8 {
+            match rx.try_recv() {
+                Ok(BuildEvent::Progress { stage, done, total }) => {
+                    self.build_status = stage;
+                    self.build_progress = if total > 0 {
+                        done as f32 / total as f32
+                    } else {
+                        0.0
+                    };
+                }
+                Ok(BuildEvent::Done(out)) => {
+                    self.apply_build_output(out);
+                    self.is_building = false;
+                    self.build_status = "Ready".to_string();
+                    self.build_progress = 1.0;
+                    finished = true;
+                    break;
+                }
+                Ok(BuildEvent::Error(e)) => {
+                    log::error!("OBJ 后台构建失败: {}", e);
+                    self.is_building = false;
+                    self.build_status = format!("Error: {}", e);
+                    self.build_progress = 0.0;
+                    finished = true;
+                    break;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+            }
+        }
+        if !finished {
+            self.build_rx = Some(rx);
+        }
+    }
+
+    /// 每帧轮询文件对话框线程（非阻塞）；对话框关闭后触发后台构建。
+    fn poll_dialog(&mut self) {
+        let rx = match self.dialog_rx.take() {
+            Some(rx) => rx,
+            None => return,
+        };
+        match rx.try_recv() {
+            Ok(Some(paths)) => {
+                if !paths.is_empty() {
+                    self.ui_state.mesh_type = panel::MeshType::ObjFile(paths);
+                    for l in &mut self.ui_state.cut_loops {
+                        l.cut = false;
+                    }
+                    self.spawn_objfile_build();
+                } else {
+                    self.is_building = false;
+                    self.build_status = "Ready".to_string();
+                    self.build_progress = 0.0;
+                }
+            }
+            Ok(None) => {
+                // 用户取消选择
+                self.is_building = false;
+                self.build_status = "Ready".to_string();
+                self.build_progress = 0.0;
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                // 对话框仍打开，保留接收端供下一帧继续轮询
+                self.dialog_rx = Some(rx);
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.is_building = false;
+                self.build_status = "Ready".to_string();
+                self.build_progress = 0.0;
+            }
+        }
+    }
+
+    /// 把后台构建产物应用到场景（GPU 相关操作仍在主线程）。
+    fn apply_build_output(&mut self, out: crate::mesh::build::BuildOutput) {
+        self.ui_state.uv_range = out.uv_range;
+        self.ui_state.surface_model = out.surface_model;
+        self.torus_mesh = Some(out.mesh.clone());
+        self.base_mesh = Some(out.mesh);
+        let (nu, nv) = self.ui_state.cut_grid_dims();
+        self.patch_colors = color_scheme::generate_patch_colors(nu, nv, &self.ui_state.color_scheme);
+        self.reapply_cuts();
+        self.rebuild_render_state();
     }
 
     fn reapply_cuts(&mut self) {
+        // OBJ 多选导入时，文件数即为补片数（每个文件一个补片）。
+        let obj_files = if let MeshType::ObjFile(p) = &self.ui_state.mesh_type {
+            p.len()
+        } else {
+            0
+        };
         if let Some(ref base) = self.base_mesh {
             let mut mesh = base.clone();
 
@@ -417,12 +603,18 @@ impl App {
                     }
                 }
             } else {
+                let np = if obj_files > 0 { obj_files } else { 1 };
                 self.patch_colors =
-                    color_scheme::generate_patch_colors(1, 1, &self.ui_state.color_scheme);
+                    color_scheme::generate_patch_colors(np, 1, &self.ui_state.color_scheme);
             }
 
             let (pu, pv) = self.ui_state.cut_grid_dims();
-            self.ui_state.patch_visible = vec![true; pu * pv];
+            let slot = if obj_files > 0 && !self.ui_state.has_cut_loops() {
+                obj_files
+            } else {
+                pu * pv
+            };
+            self.ui_state.patch_visible = vec![true; slot];
 
             if self.ui_state.has_cut_loops() {
                 match self.ui_state.cut_mode {
@@ -459,13 +651,15 @@ impl App {
                         }
                     }
                 }
-            } else {
+            } else if obj_files == 0 {
                 for f in &mut mesh.faces {
                     if f.valid {
                         f.patch_index = Some((0, 0));
                     }
                 }
             }
+            // 注：OBJ 多选导入（无切割线）时 obj_files > 0，不进入上面的
+            // else 分支，从而保留导入时写入的逐文件 patch_index。
 
             if self.ui_state.cut_mode == crate::ui::panel::CutMode::Knot {
                 let max_pu = mesh
@@ -484,6 +678,7 @@ impl App {
 
             // 拓扑已在切割前三角化；此处无需重复（to_3d_view_mesh 只重算顶点位置）
             self.torus_mesh = Some(mesh);
+            self.cached_stats = self.torus_mesh.as_ref().map(|m| m.compute_stats());
         }
     }
 
@@ -556,6 +751,18 @@ impl App {
 
     fn recolor_patches(&mut self) {
         if let Some(ref mut mesh) = self.torus_mesh {
+            // OBJ 多选导入（无切割线）：保留导入时写入的逐文件 patch_index，
+            // 仅按文件数重新生成配色，避免被 UV 网格重排补片而丢失逐文件分组。
+            if let MeshType::ObjFile(paths) = &self.ui_state.mesh_type {
+                if !self.ui_state.has_cut_loops() {
+                    let n = paths.len().max(1);
+                    self.patch_colors =
+                        color_scheme::generate_patch_colors(n, 1, &self.ui_state.color_scheme);
+                    self.ui_state.patch_visible = vec![true; n];
+                    self.rebuild_render_state();
+                    return;
+                }
+            }
             match self.ui_state.cut_mode {
                 crate::ui::panel::CutMode::Grid => {
                     let u_vals = self.ui_state.cut_u_values();
@@ -641,7 +848,9 @@ impl App {
 
     fn rebuild_render_state(&mut self) {
         if self.torus_mesh.is_none() {
-            self.build_torus_mesh();
+            // 后台构建进行中（torus_mesh 尚未就绪）时不强制同步构建，避免触发
+            // ObjFile 分支或崩溃；待 worker 完成后再由 apply_build_output 调用。
+            return;
         }
 
         let device = self.device.as_ref().unwrap();
@@ -1041,6 +1250,13 @@ impl App {
     pub fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
         self.update();
 
+        // 镜像后台构建状态到 UI 状态栏，并轮询 worker 线程（不阻塞主线程）
+        self.ui_state.is_building = self.is_building;
+        self.ui_state.build_status = self.build_status.clone();
+        self.ui_state.build_progress = self.build_progress;
+        self.poll_build_worker();
+        self.poll_dialog();
+
         // ---- Build egui UI on UI window ----
         let mut needs_rebuild = false;
         let mut needs_reapply_cuts = false;
@@ -1060,7 +1276,13 @@ impl App {
             .as_mut()
             .unwrap()
             .take_egui_input(self.render_window.as_ref().unwrap());
-        let mesh_stats = self.torus_mesh.as_ref().map(|m| m.compute_stats());
+        // 网格统计已缓存（仅在网格变化时重算），避免每帧 compute_stats 占用主线程。
+        // 后台构建/对话框打开期间不显示统计（网格尚未就绪）。
+        let mesh_stats = if self.is_building {
+            None
+        } else {
+            self.cached_stats
+        };
         let full_output = self.egui_ctx.run(raw_input, |ctx| {
             let action = panel::render_ui_panel(
                 ctx,
@@ -1107,25 +1329,27 @@ impl App {
         });
 
         // Handle deferred actions
-        if needs_open_obj {
-            let file = rfd::FileDialog::new()
-                .add_filter("OBJ Files", &["obj"])
-                .add_filter("All Files", &["*"])
-                .set_title("Open OBJ File")
-                .pick_file();
-            if let Some(path) = file {
-                let path_str = path.to_string_lossy().to_string();
-                self.ui_state.mesh_type = panel::MeshType::ObjFile(path_str);
-                for l in &mut self.ui_state.cut_loops {
-                    l.cut = false;
-                }
-                needs_rebuild = true;
-            }
+        if needs_open_obj && self.dialog_rx.is_none() {
+            // 文件对话框放到后台线程打开：rfd 模态对话框会接管消息循环并阻塞父窗口，
+            // 若在主线程同步调用则表现为"未响应"。线程返回结果后由 poll_dialog 触发构建。
+            let (tx, rx) = std::sync::mpsc::channel::<Option<Vec<String>>>();
+            self.dialog_rx = Some(rx);
+            self.is_building = true;
+            self.build_status = "Selecting OBJ files…".to_string();
+            self.build_progress = 0.0;
+            spawn_obj_dialog(tx);
         }
         if needs_rebuild {
-            self.build_torus_mesh();
-            self.reapply_cuts();
-            self.rebuild_render_state();
+            // OBJ 多选导入较重，放到后台 worker 线程，避免主线程卡死（"未响应"）。
+            // 其余网格类型（Quad/Delaunay）构建很快，仍同步执行。
+            match &self.ui_state.mesh_type {
+                panel::MeshType::ObjFile(_) if !self.is_building => self.spawn_objfile_build(),
+                _ => {
+                    self.build_torus_mesh();
+                    self.reapply_cuts();
+                    self.rebuild_render_state();
+                }
+            }
         }
         if needs_reapply_cuts {
             self.reapply_cuts();
@@ -1212,7 +1436,6 @@ impl App {
                 self.ui_state.export_dir_patches = path.to_string_lossy().to_string();
             }
         }
-
         let device = self.device.as_ref().unwrap();
         let queue = self.queue.as_ref().unwrap();
         let render_state = self.render_state.as_ref().unwrap();

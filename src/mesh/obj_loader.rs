@@ -145,9 +145,72 @@ fn parse_face_vert(s: &str) -> Option<FaceVert> {
     Some(FaceVert { pos, uv })
 }
 
+// 保留给 delaunay 集成测试使用（非测试构建下无其它调用方，故允许 dead_code）。
+#[allow(dead_code)]
 pub fn load_obj_as_half_edge(path: &str) -> Result<HalfEdgeMesh, String> {
     let (positions, uvs, triangles) = load_obj(path)?;
     Ok(HalfEdgeMesh::from_triangles(&positions, &uvs, &triangles))
+}
+
+/// 加载多个 OBJ 文件并合并为一个半边网格。
+///
+/// 每个文件成为一个独立补片：`patch_index = (file_idx, 0)`。
+/// - 单文件内部的 (pos, uv) 去重已在 [`load_obj`] 中完成；
+/// - 跨文件**不做顶点焊接**（各 OBJ 本就是彼此独立的补片）；
+/// - [`HalfEdgeMesh::from_triangles`] 的 twin 配对按顶点索引 key，
+///   不同文件的顶点区间互不相交，天然不会跨文件配对。
+///
+/// 任一个文件加载失败时跳过并告警，其余文件继续；若全部失败则返回错误。
+pub fn load_objs_as_half_edge(
+    paths: &[String],
+    report: &mut dyn FnMut(usize, usize),
+) -> Result<HalfEdgeMesh, String> {
+    if paths.is_empty() {
+        return Err("No OBJ files selected".into());
+    }
+    let mut positions: Vec<Vec3> = Vec::new();
+    let mut uvs: Vec<Vec2> = Vec::new();
+    let mut triangles: Vec<(usize, usize, usize)> = Vec::new();
+    let mut tri_counts: Vec<usize> = Vec::with_capacity(paths.len());
+    let mut loaded = 0usize;
+    for path in paths {
+        match load_obj(path) {
+            Ok((p, u, t)) => {
+                let offset = positions.len();
+                let count = t.len();
+                positions.extend(p);
+                uvs.extend(u);
+                for (a, b, c) in t {
+                    triangles.push((a + offset, b + offset, c + offset));
+                }
+                tri_counts.push(count);
+                loaded += 1;
+                report(loaded, paths.len());
+            }
+            Err(e) => {
+                log::warn!("跳过无法加载的 OBJ '{}': {}", path, e);
+                report(loaded, paths.len());
+            }
+        }
+    }
+    if positions.is_empty() {
+        return Err("所有选中的 OBJ 均无法加载".into());
+    }
+    let mut mesh = HalfEdgeMesh::from_triangles(&positions, &uvs, &triangles);
+    // 按三角形连续区间给每个文件分配 patch_index = (file_idx, 0)。
+    // 注意：from_triangles 按 face_triplets 的顺序建面，face i 对应 triangle i。
+    let mut face_idx = 0usize;
+    for (file_idx, &count) in tri_counts.iter().enumerate() {
+        for _ in 0..count {
+            if let Some(f) = mesh.faces.get_mut(face_idx) {
+                if f.valid {
+                    f.patch_index = Some((file_idx, 0));
+                }
+            }
+            face_idx += 1;
+        }
+    }
+    Ok(mesh)
 }
 
 #[cfg(test)]
@@ -167,5 +230,41 @@ mod tests {
         let fv = parse_face_vert("3/4/5").unwrap();
         assert_eq!(fv.pos, 2);
         assert_eq!(fv.uv, Some(3));
+    }
+
+    #[test]
+    fn test_load_objs_as_half_edge_multi_patch() {
+        let path = "models/torus.obj".to_string();
+        let single = match load_obj_as_half_edge(&path) {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("Skipping test: could not load {}: {}", path, e);
+                return;
+            }
+        };
+        let single_faces = single.faces.len();
+        assert!(single_faces > 0, "单文件应至少有 1 个面");
+
+        let merged = match load_objs_as_half_edge(&[path.clone(), path.clone()], &mut |_, _| {}) {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("Skipping test: could not load {}: {}", path, e);
+                return;
+            }
+        };
+        assert_eq!(merged.faces.len(), single_faces * 2, "面数应为单文件的两倍");
+
+        // patch_index 应分两段：(0,0) 与 (1,0)
+        let mut seen0 = 0usize;
+        let mut seen1 = 0usize;
+        for f in &merged.faces {
+            match f.patch_index {
+                Some((0, 0)) => seen0 += 1,
+                Some((1, 0)) => seen1 += 1,
+                other => panic!("意外的 patch_index {:?}", other),
+            }
+        }
+        assert_eq!(seen0, single_faces);
+        assert_eq!(seen1, single_faces);
     }
 }
