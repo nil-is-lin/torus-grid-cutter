@@ -43,22 +43,35 @@ jobs:
         run: |
           echo "=== target/release ==="
           ls -la target/release
-          echo "=== binary present? ==="
-          ls target/release/torus_grid_cutter* 2>/dev/null || echo "BINARY MISSING"
+          echo "=== target/release/deps ==="
+          ls -la target/release/deps | head -40
 
       - name: Rename artifact
         shell: bash
         run: |
           shopt -s nullglob
-          if [ -f target/release/torus_grid_cutter.exe ]; then
-            mv target/release/torus_grid_cutter.exe torus_grid_cutter-windows.exe
-          fi
-          if [ -f target/release/torus_grid_cutter ]; then
-            case "${{ runner.os }}" in
-              Linux)  mv target/release/torus_grid_cutter torus_grid_cutter-linux ;;
-              macOS) mv target/release/torus_grid_cutter torus_grid_cutter-macos ;;
+          BIN=""
+          # 优先 target/release/<name>(无哈希),回退 target/release/deps/<name>-<hash>(带哈希)
+          for cand in \
+            target/release/torus_grid_cutter.exe \
+            target/release/torus_grid_cutter \
+            target/release/deps/torus_grid_cutter-*.exe \
+            target/release/deps/torus_grid_cutter-*; do
+            case "$cand" in
+              *.d|*.rlib|*.rmeta) continue ;;
             esac
+            if [ -f "$cand" ]; then BIN="$cand"; break; fi
+          done
+          if [ -z "$BIN" ]; then
+            echo "!! binary not found in target/release or target/release/deps"
+            exit 1
           fi
+          echo "found: $BIN"
+          case "${{ runner.os }}" in
+            Windows) mv "$BIN" torus_grid_cutter-windows.exe ;;
+            Linux)   mv "$BIN" torus_grid_cutter-linux ;;
+            macOS)   mv "$BIN" torus_grid_cutter-macos ;;
+          esac
           echo "=== renamed artifacts ==="
           ls -la torus_grid_cutter-* 2>/dev/null || { echo "!! no artifact produced"; exit 1; }
 
