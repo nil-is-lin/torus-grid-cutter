@@ -2,6 +2,7 @@
 name = "torus-grid-cutter"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.85"
 description = "Torus mesh cutting and UV unwrapping tool: quad/Delaunay mesh generation, U/V-grid and torus-knot cutting, per-patch shaders, UV plane view, OBJ export"
 license = "MIT"
 readme = "README.md"

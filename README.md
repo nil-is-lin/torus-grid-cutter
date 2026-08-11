@@ -1,6 +1,12 @@
+<p align="right">
+  <strong>中文</strong> | <a href="./README_EN.md">English</a>
+</p>
+
 # Torus Grid Cutter
 
 [![CI](https://github.com/nil-is-lin/torus-grid-cutter/actions/workflows/ci.yml/badge.svg)](https://github.com/nil-is-lin/torus-grid-cutter/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/nil-is-lin/torus-grid-cutter)](https://github.com/nil-is-lin/torus-grid-cutter/releases)
+[![文档](https://img.shields.io/badge/docs-LaTeX-blue)](doc/)
 
 基于 **wgpu + egui** 的环面网格切割与 UV 展开工具：参数化生成环面网格（四边形 / 周期 Delaunay / OBJ），沿 U/V 网格线或 Torus Knot 曲线切割成补片（patch），支持 42 种着色器渲染、UV 平面展开视图与按补片导出 OBJ。
 
@@ -60,11 +66,16 @@ src/
 ├── main.rs / lib.rs     入口
 ├── app.rs               应用状态机：网格构建 / 切割 / 渲染状态重建 / 输入处理
 ├── mesh/                核心算法（纯数据，无渲染依赖）
+│   ├── mod.rs           模块导出
 │   ├── half_edge.rs     半边网格结构（顶点 / 半边 / 面 / 边翻转 / 三角化）
+│   ├── build.rs         网格构造（Quad / Delaunay / OBJ）
 │   ├── torus.rs         环面参数化与展开（unfold_position）
 │   ├── cut.rs           U/V/Knot 切割、补片索引分配
 │   ├── delaunay.rs      周期 Delaunay 生成
 │   ├── surface.rs       环面曲面拟合
+│   ├── stats.rs         网格统计
+│   ├── uv.rs            UV 映射辅助
+│   ├── vertex.rs        顶点类型 / 辅助
 │   └── obj_loader.rs    OBJ 解析
 ├── render/              wgpu 渲染：管线 / 顶点缓冲 / 线框（网格边、切割线、Knot 曲线）
 ├── ui/panel.rs          egui 面板（4 个流程页）
