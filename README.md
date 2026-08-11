@@ -18,26 +18,14 @@
 
 ## 演示视频
 
-> 录制一段操作演示（生成网格 → U/V 切割 → Knot 切割 → 区域着色 → 导出），
-> 上传后在此嵌入。视频文件（mp4）不提交 git——放在 GitHub Releases 附件
-> 或外部平台（Bilibili / YouTube），README 引用链接即可。
+> 演示视频随仓库分发：mp4 放在 `docs/demo.mp4`，通过 **GitHub Pages** 托管，
+> 浏览器点击即可在线播放（不会强制下载）。需要在仓库
+> **Settings → Pages** 中将 Source 设为 `main` 分支的 `/docs` 目录。
 
-**方式 A：GitHub Releases 附件**（推荐，随仓库分发）
-
-[▶ 观看演示视频（15 MB）· v0.1.0](https://github.com/nil-is-lin/torus-grid-cutter/releases/download/v0.1.0/demo.mp4)
-
-> 注：GitHub README 出于安全策略会剥除 `<video>` 标签，内嵌播放不可用——
-> 点击上面链接浏览器直接播放，或下载后在本地播放器打开。
-> 如需 README 内自动播放的预览图，可再录一段 GIF 放 `assets/demo.gif`，
-> 在 README 头部加 `![演示](assets/demo.gif)`。
-
-**方式 B：外部平台链接**
-
-```markdown
-[▶ 操作演示视频（Bilibili/YouTube）](https://www.example.com/watch?v=xxxx)
-```
+[▶ 观看演示视频（15 MB）](https://nil-is-lin.github.io/torus-grid-cutter/demo.mp4)
 
 录制建议：窗口 1280×720，OBS / Windows Game Bar 均可；建议时长 1–3 分钟。
+上传步骤：将 `demo.mp4` 放入本仓库 `docs/` 目录并提交推送即可。
 
 ## 构建
 
