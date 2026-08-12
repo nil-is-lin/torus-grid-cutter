@@ -16,14 +16,14 @@
   numberstyle=\tiny,
   frame=single,
   breaklines=true,
-  morekeywords={pub, fn, let, mut, for, in, if, else, use, mod, struct, impl, self, Self, true, false, return, match, loop, while, break, continue, move, ref, const, static, type, trait, where, as, extern, crate, super, unsafe, dyn, async, await, f64, f32, Vec3, Vec2},
+  morekeywords={pub, fn, let, mut, for, in, if, else, use, mod, struct, impl, self, Self, true, false, return, match, loop, while, break, continue, move, ref, const, static, type, trait, where, as, extern, crate, super, unsafe, dyn, async, await, f64, f32, Vec3, Vec2, usize, isize, Some, None},
   sensitive=true,
   morecomment=[l]{//},
   morecomment=[s]{/*}{*/},
   morestring=[b]",
 }
 
-\title{Knot Cutting \& Region Coloring Algorithm（现行实现）}
+\title{Torus Knot 切割与区域着色算法（现行实现）}
 \date{}
 
 \begin{document}
@@ -31,187 +31,344 @@
 
 \section{总览}
 
-Torus Knot 切割把一条解析曲线 $v = k\,u$（在 UV 参数域内实际有多条分支
-$v = k\,u + 2\pi n$）投影到网格表面，沿曲线把与之相交的三角形/四边形切开，
-并按曲线在 UV 平面划分的“条带”为每个面分配区域颜色。
+Torus Knot 切割把解析曲线族 $v = k\,u + 2\pi n\ (n\in\mathbb{Z})$ 投影到环面网格的
+UV 参数域，沿曲线把与之相交的面切开，并为每个面指派其所属的\textbf{环面拓扑区域}
+编号供 ByRegion 着色使用。
 
-关键事实（纠正旧文档）：
+现行实现由两条彼此独立的链路组成，理解这一分工是全文的关键：
+
+\begin{center}
+\begin{tabular}{@{}p{2.4cm}p{5.2cm}p{5.4cm}@{}}
+\hline
+\textbf{链路} & \textbf{入口} & \textbf{职责} \\
+\hline
+几何切割 & \texttt{cut\_mesh\_by\_knots} & 插顶点、加弦、标记 \texttt{cut} 屏障边 \\
+区域指派 & \texttt{assign\_connected\_}\-\texttt{components\_knot} & 逐面按\textbf{解析拓扑不变量}算区域号 \\
+\hline
+\end{tabular}
+\end{center}
+
+区域指派\textbf{不依赖}切割结果的连通性——它是纯解析公式。这一解耦是本轮重写的
+核心：任何基于 flood-fill 的连通块统计在环面接缝处都极其脆弱（见
+第~\ref{sec:whyformula} 节），而解析公式对任意 $k$、任意网格分辨率都恒定正确。
+
+\paragraph{相对旧文档的实质修正}
 \begin{enumerate}
-\item 一条 knot 曲线在 $[0,2\pi]\times[0,2\pi]$ 的参数方域内有 $k$ 条分支
-（每 $2\pi$ 一条）。\textbf{必须切开面跨越的全部分支}，旧实现只切最低分支
-（$n_{\mathrm{lo}}$）会大量漏切，导致实际切割边与渲染的完整曲线不一致。
-\item 区域编号不使用符号位编码 \texttt{pu = s1 | (s2<<1)}，而是用
-\texttt{(v - k*u).div\_euclid(2\(\pi\))} 得到每个 knot 的“条带编号”，再用
-\texttt{BTreeSet} 对所有面的条带向量去重，得到连续的 UV 平面区域颜色编号。
+\item 分支范围两端都用 $\lfloor\cdot\rfloor$，\textbf{不是} $n_{\mathrm{lo}}=\lceil\phi_{\min}/2\pi\rceil$。
+  旧公式在 $\phi<0$ 时算出 $n_{\mathrm{lo}}>n_{\mathrm{hi}}$，使 \texttt{for branch in n\_lo..=n\_hi}
+  退化为空循环、整面漏切（见第~\ref{sec:branchrange} 节）。
+\item 切割入口是 \texttt{cut\_face\_knots}，一次性处理\textbf{所有曲线的所有分支}。
+  旧的 \texttt{cut\_face\_local\_knot} 已删除，
+  逐曲线串行切割的“修复遍”也一并取消。
+\item 区域语义是\textbf{环面拓扑区域}（区域数 $=|k_2-k_1|$），\textbf{不是} UV 平面条带
+  （$k+1$ 条）。函数 \texttt{assign\_multi\_knot\_patch\_indices} 及其
+  \texttt{div\_euclid} 条带向量 + \texttt{BTreeSet} 去重方案已删除。
 \end{enumerate}
 
-\section{网格：展开 UV 域}
+\section{参数域、曲线与容差}
 
-顶点在 $u=0$ 与 $u=2\pi$ 处是独立顶点（由 \texttt{generate\_unfolded\_quad\_mesh}
-生成 $(res\_u+1)\times(res\_v+1)$ 顶点），没有面跨过周期边界。所有顶点 UV
-坐标 $\in [0,2\pi]$。
+\subsection*{UV 域}
 
-\texttt{clamp\_uv} 把交点夹到 $[0,2\pi]$ 而不是模 $2\pi$ 包裹，从而保留
-$u=0$ 与 $u=2\pi$ 作为两个独立边界。
+顶点在 $u=0$ 与 $u=2\pi$ 处是\textbf{独立顶点}（\texttt{generate\_unfolded\_quad\_mesh}
+生成 $(res\_u+1)\times(res\_v+1)$ 顶点），没有面跨过周期边界。
+\texttt{clamp\_uv} 把新交点夹到 $[\min,\max]$ 而\textbf{不}模 $2\pi$ 包裹，从而保留
+$u=0$ 与 $u=2\pi$ 为两条独立边界（接缝）。
+
+所有涉及曲线方程的计算先经 \texttt{normalize\_uv} 归一化到 $[0,2\pi)$，再用
+\texttt{unwrap\_angle} 相对面内首顶点解缠（使 $|x-r|\le\pi$），保证同一面内的顶点
+坐标连续、跨接缝面也不撕裂。
+
+\subsection*{相位函数 $\phi$}
+
+对给定 $k$ 定义
+\[
+\phi(u,v) = v - k\,u .
+\]
+曲线的第 $n$ 条分支即等值线 $\phi = 2\pi n$。分支 $n$ 覆盖 $\phi\in[2\pi n,\,2\pi(n+1))$。
+
+\subsection*{容差常量}
+
+\begin{center}
+\begin{tabular}{@{}llp{7.6cm}@{}}
+\hline
+\textbf{常量} & \textbf{值} & \textbf{用途} \\
+\hline
+\texttt{EPSILON} & $10^{-8}$ & 分母退化判定、$t$ 的区间松弛 \\
+\texttt{MERGE\_EPS} & $10^{-4}$ & Grid 切割的“顶点在线上”判定 \\
+\texttt{COINCIDENT\_TOL} & $10^{-4}$ & \textbf{同一面内}顶点 3D 重合判定 \\
+\texttt{KNOT\_SNAP\_UV} & $10^{-3}$ & knot 曲线顶点吸附（参数域垂直距离） \\
+\hline
+\end{tabular}
+\end{center}
+
+\paragraph{顶点吸附 \texttt{KNOT\_SNAP\_UV}}
+高分辨率网格下曲线经常“几乎”穿过某个既有顶点：交点落在距该顶点 $\sim10^{-4}$ uv 处。
+照实插入会得到近零长边与 sliver 面，随后沿分支排序、弦连接、\texttt{cut} 标记全部
+退化（同一位置出现 2$\sim$3 个相距 $3\times10^{-5}$ 的顶点），曲线链断开。
+解法是把这类交点\textbf{吸附到该顶点}（分类为 \texttt{Side::OnLine}），几何偏差上界即
+本容差（$npts=1600$ 时约为边长的 1\%，肉眼不可见），而拓扑变得严格干净。
+
+容差\textbf{必须与面无关}，否则同一条边的两侧面对同一顶点给出不同分类。故取参数域
+垂直距离，换算到 $\phi$ 空间时乘 $\sqrt{1+k^2}$：
+\[
+\mathrm{snap}(k) = \mathtt{KNOT\_SNAP\_UV}\cdot\sqrt{1+k^2}
+\qquad(\texttt{knot\_snap\_phi})
+\]
+整数 $k$ 下 $\phi$ 的跨面差恒为 $2\pi$ 的整数倍，被分支索引吸收，故分类跨面一致。
+
+\paragraph{禁止跨面焊接顶点}
+\texttt{COINCIDENT\_TOL} 只在\textbf{同一个面内}比较（见 \texttt{face\_vertex\_near}）。
+曾有一版维护全局“接缝焊接表”，按 3D 坐标跨面复用顶点，企图让曲线在接缝处共享
+顶点——那是错的：会制造 pinch 顶点（一个顶点同属两侧互不相连的扇形），使顶点轨道
+遍历只覆盖半个扇形、面切不开。跨接缝的连通性只应由 \texttt{build\_seam\_pairs} 在
+需要时按 3D 距离配对处理。
+
+\section{面跨越的分支范围：\texttt{knot\_branch\_range}}
+\label{sec:branchrange}
+
+对整张面算出 $\phi\in[\phi_{\min},\phi_{\max}]$（\texttt{face\_phi\_values}），
+则需枚举的分支为
+\[
+n_{\min} = \left\lfloor \frac{\phi_{\min}-\mathrm{snap}}{2\pi} \right\rfloor,
+\qquad
+n_{\max} = \left\lfloor \frac{\phi_{\max}+\mathrm{snap}}{2\pi} \right\rfloor .
+\]
+两端都是 $\lfloor\cdot\rfloor$，因为分支 $n$ 覆盖 $[2\pi n, 2\pi(n+1))$，
+“包含 $\phi$ 的分支”就是满足 $2\pi n\le\phi$ 的最大整数 $n$。
+
+\paragraph{旧实现的 ceil bug（已修复）}
+旧代码写作 $n_{\mathrm{lo}}=\lceil(\phi_{\min}-\mathrm{snap})/2\pi\rceil$。取
+$\phi_{\min}=-12.49$：$\lceil-1.988\rceil=-1$，而 $2\pi\cdot(-1)=-6.28$ 根本
+\textbf{不}覆盖 $-12.49$；正确值是 $\lfloor-1.988\rfloor=-2$。于是
+$n_{\mathrm{lo}}=-1>n_{\mathrm{hi}}=-2$，上游 \texttt{for branch in n\_lo..=n\_hi}
+静默空循环，该面\textbf{整个没被切}。在 Quad 网格 $+\ k=[3,10]$ 之类大幅度值时
+（大量面 $\phi$ 为负、需多个分支覆盖）尤其致命：区域数退化为 1，整片一色。
+
+末尾另有 swap 防御：极端数值下 snap 让 $n_{\min}$ 跨过 $n_{\max}$ 时交换两者，
+杜绝任何静默空循环。
 
 \section{相交检测：\texttt{intersect\_face\_knot\_branch}}
 
-给定面顶点 $\{(u_i,v_i)\}$、knot 参数 $k$ 与分支号 \texttt{branch}：
+给定面顶点 $\{(u_i,v_i)\}$、参数 $k$ 与分支号 \texttt{branch}，目标常数
+$\mathrm{target}=2\pi\cdot\texttt{branch}$。
 
-\subsection*{Step 1：归一化并展开 UV}
-
-对第一个顶点取参考 $(u_0,v_0)$，把每个 UV 归一化到 $[0,2\pi)$：
+\subsection*{Step 1：归一化、解缠、算 $\phi$}
 \[
-\bar u_i = \mathrm{normalize\_uv}(u_i,\; \min_u,\max_u),\qquad
-\bar v_i = \mathrm{normalize\_uv}(v_i,\; \min_v,\max_v)
-\]
-再相对参考展开（保证 $\bar u_i-\bar u_0\in[-\pi,\pi]$，处理接缝）：
-\[
-a_i = \mathrm{unwrap}(\bar u_i,\; \bar u_0),\qquad
-b_i = \mathrm{unwrap}(\bar v_i,\; \bar v_0)
-\]
-其中 \texttt{unwrap(x, r)} 通过 $\pm 2\pi$ 调整使 $|x-r|\le \pi$。
-
-\subsection*{Step 2：计算 $\phi$ 与目标分支}
-
-\[
-\phi_i = b_i - k\,a_i
-\]
-目标分支对应的常数为：
-\[
-\mathrm{target} = 2\pi \cdot \mathrm{branch}
+\bar u_i=\mathrm{normalize\_uv}(u_i),\quad
+a_i=\mathrm{unwrap}(\bar u_i,\bar u_0),\quad
+b_i=\mathrm{unwrap}(\bar v_i,\bar v_0),\quad
+\phi_i=b_i-k\,a_i
 \]
 
-\subsection*{Step 3：顶点分类（Side）}
-
+\subsection*{Step 2：顶点分类（吸附优先）}
 \[
-\mathrm{side}_i = \begin{cases}
-\mathrm{OnLine} & |\phi_i - \mathrm{target}| < \mathrm{MERGE\_EPS} \\
-\mathrm{Less}   & \phi_i - \mathrm{target} < 0 \\
-\mathrm{Greater} & \phi_i - \mathrm{target} > 0
+\mathrm{side}_i=\begin{cases}
+\texttt{OnLine} & |\phi_i-\mathrm{target}|<\mathrm{snap}(k)\\
+\texttt{Less} & \phi_i-\mathrm{target}<0\\
+\texttt{Greater} & \phi_i-\mathrm{target}>0
 \end{cases}
 \]
-其中 $\mathrm{MERGE\_EPS}=10^{-4}$（用于“顶点在 knot 线上”的判定，比
-$\mathrm{EPSILON}=10^{-8}$ 宽松，因为相邻边分裂产生的顶点经
-unwrap+wrap 往返后 $\phi$ 可能略超 $10^{-8}$）。
+若全部顶点均为 \texttt{OnLine}（面整体贴合曲线），直接返回全体顶点作为
+\texttt{on\_line\_vertices}、无边交点。若既无 \texttt{Less} 又无 \texttt{Greater} 的
+横跨、也没有 \texttt{OnLine}，返回 \texttt{None}。
 
-\subsection*{Step 4：求边交点}
+\subsection*{Step 3：求边交点（跳过已吸附的边）}
 
-对每条边 $(i,i{+}1)$，若两端 side 不同或涉及 OnLine：
-\[
-t = \frac{-(\phi_i - \mathrm{target})}{(\phi_{i+1}-\mathrm{target}) - (\phi_i-\mathrm{target})},
-\quad \text{夹到 }[0,1]
-\]
-过滤：起点 OnLine 且 $t<\mathrm{MERGE\_EPS}$ 跳过；终点 OnLine 且
-$t>1-\mathrm{MERGE\_EPS}$ 跳过。新顶点 UV 用 \texttt{clamp\_uv} 夹到
-$[0,2\pi]$。
-
-\section{面跨越的分支范围：\texttt{knot\_branch\_range}}
-
-对整张面计算 $\phi\in[\phi_{\min},\phi_{\max}]$，则覆盖的分支为：
-\[
-n_{\mathrm{lo}} = \left\lceil \frac{\phi_{\min}}{2\pi} \right\rceil,\qquad
-n_{\mathrm{hi}} = \left\lfloor \frac{\phi_{\max}}{2\pi} \right\rfloor
-\]
-若 $n_{\mathrm{lo}} > n_{\mathrm{hi}}$：面不跨任何分支，返回无交点。
-
-\section{面切割：\texttt{cut\_face\_local\_knot}}
-
-这是与旧文档“只处理第一个分支”\textbf{最本质的区别}：
-
-\begin{lstlisting}[]
-let (n_lo, n_hi) = knot_branch_range(&get_face_uvs(mesh, face), k, uv_range);
-if n_lo > n_hi { return false; }
-let mut cut_any = false;
-for branch in n_lo..=n_hi {              // 遍历 ALL 分支
-    let face_verts = get_face_uvs(mesh, face);
-    let Some(isect) = intersect_face_knot_branch(&face_verts, k, branch, uv_range) else { continue; };
-    // 相交的非三角形面先局部三角化，再按交点切分
-    if !isect.edge_points.is_empty() {
-        let hes = mesh.face_half_edges(face);
-        if hes.len() > 3 { triangulate_face(mesh, face); }
-    }
-    let face_verts = get_face_uvs(mesh, face);
-    if let Some(isect) = intersect_face_knot_branch(&face_verts, k, branch, uv_range) {
-        cut_face_by_intersection(mesh, face, &isect);
-        cut_any = true;
-    }
-}
-cut_any
-\end{lstlisting}
-
-也就是说，一个面若同时跨越多条 knot 分支，会被逐分支依次切开——这正是
-\href{https://example.com}{CHANGELOG} 中“multi-branch knot fix”所修复的行为。
-
-\section{逐线切割与修复：\texttt{cut\_mesh\_by\_knot\_line}}
-
-对每条 knot 参数 $k$：
-\begin{enumerate}
-\item 单遍扫描所有面，调用 \texttt{cut\_face\_local\_knot} 切割。
-\item \textbf{修复遍}：单遍可能漏掉“切割线恰好穿过顶点”的相邻面。重复最多 5 遍：
-  对每个有效面计算 $\phi=v-k\,u$ 在各分支上的 $\min/\max$，若某分支
-  $\mathrm{target}$ 两侧分别存在顶点（$\mathrm{has\_below}$ 且
-  $\mathrm{has\_above}$，容差 $10^{-4}$），说明该面仍骑跨该分支，则再次调用
-  \texttt{cut\_face\_local\_knot}。修复遍无新切割即停止。
-\end{enumerate}
-
-\section{区域着色：\texttt{assign\_multi\_knot\_patch\_indices}}
-
-为每个有效面计算一个“条带向量”，去重后映射为连续颜色编号。
-
-\subsection*{Step 1：单 knot 条带函数}
-
-对每个 knot $k$，条带编号定义为：
-\[
-\mathrm{band}(u,v,k) = (v - k\,u)\ \mathrm{div\_euclid}\ 2\pi \in \mathbb{Z}
-\]
-（注意：$\mathrm{div\_euclid}$ 对整数 $k$ 在 $(u,v)\to(u+2\pi,v+2\pi)$
-下不变，故可直接用原始 UV 值，无需先归一化。）
-
-\subsection*{Step 2：选最无歧义的顶点}
-
-对每个面，枚举其所有顶点，计算每个顶点到各 knot 线最近分支的有符号距离，
-取“离所有 knot 线最远”的顶点 $(u,v)$ 作为分类依据。混合策略：
+对每条边 $(i_0,i_1)$：
 \begin{itemize}
-\item 若该顶点明显远离所有 knot 线（最小距离 $>0.1$），直接用其 $(u,v)$ 分类——稳健且精确；
-\item 否则（面靠近 knot 交点）改用 \texttt{circular\_centroid}（先相对首顶点展开、再取圆均值）以获得更稳定的方向信号。
+\item \textbf{任一端点为 \texttt{OnLine} $\Rightarrow$ 跳过}。该边的穿越由该顶点本身
+  代表，不再插点。旧实现改用 $t<\mathtt{MERGE\_EPS}$ 判断，但 $t$ 的阈值与吸附容差
+  无关：吸附后 $d_0$ 最大可达 $\mathrm{snap}$，算出的 $t$ 远超 $10^{-4}$，会在顶点旁
+  $\sim\mathrm{snap}$ 处再插一个近重合顶点，正是 sliver 的来源。
+\item 两端同侧 $\Rightarrow$ 跳过。
+\item 否则线性插值
+  $t=-d_0/(d_1-d_0)$，$d_j=\phi_{i_j}-\mathrm{target}$，夹到 $[0,1]$；
+  3D 位置按 $t$ 线性插值，新 UV 由解缠坐标插值后经 \texttt{clamp\_uv} 夹回域内。
 \end{itemize}
 
-\subsection*{Step 3：构造条带向量并去重}
+\section{面切割：\texttt{cut\_face\_knots}}
 
+这是与旧文档最本质的结构差异：\textbf{一个面在一次调用内处理所有曲线的所有分支}，
+把全部切割弦收集后统一落地。
+
+\begin{lstlisting}[]
+let fv = get_face_uvs(mesh, face);
+let mut chords: Vec<(VertexId, VertexId)> = Vec::new();
+for &k in k_values {                        // 所有曲线
+    let (n_lo, n_hi) = knot_branch_range(&fv, k, uv_range);
+    for branch in n_lo..=n_hi {             // 所有分支
+        let Some(isect) = intersect_face_knot_branch(&fv, k, branch, uv_range)
+            else { continue };
+        // 边交点插入 + OnLine 顶点直接复用
+        let mut pts = ...;                   // insert_boundary_point / VertexId
+        if pts.len() < 2 { continue; }
+        let ordered = order_verts_along_branch(mesh, face, &pts, k, uv_range);
+        for w in ordered.windows(2) {        // 开口折线，不闭合
+            let (a, b) = (w[0], w[1]);
+            if mark_edge_cut_between(mesh, face, a, b)
+                || mark_edge_cut_anywhere(mesh, a, b) { /* 沿已有边切 */ }
+            else { chords.push((a, b)); }    // 真正的对角线弦
+        }
+    }
+}
+for (a, b) in chords { add_chord(mesh, a, b, uv_range, 0); }
+\end{lstlisting}
+
+\paragraph{为何必须一次性处理所有曲线}
+逐条曲线串行切割会让第二条曲线的弦落在已被第一条切出的子面上，两条曲线在共享顶点处
+\textbf{串接}成单条环——那样不会把环面分开，区域会错误合并。正确做法是在同一切面内
+同时添加各曲线的弦；若两条曲线在面内相交，由 \texttt{insert\_crossing\_vertex} 在交点
+插入内部顶点，使其成为真正的\textbf{横截交叉}（四面对应）。
+
+\paragraph{沿分支方向排序（\texttt{order\_verts\_along\_branch}）}
+分支在参数域内是直线，面内交点必然共线，排序键取其方向 $(1,k)$ 上的投影
+$u+k\,v$，排完连成\textbf{开口折线}。旧实现用 \texttt{order\_verts\_on\_face}
+（绕面边界排序）并首尾闭合：2 个点时重复连同一条弦，$\ge 3$ 个点时连成闭合三角形，
+凭空多出屏障边 $\Rightarrow$ 区域被错误切碎。
+
+\paragraph{三段式落地，任何一段都不许静默丢弃}
+\begin{enumerate}
+\item \texttt{mark\_edge\_cut\_between(face, a, b)}：曲线正好走在本面已有边上
+  （角点、接缝、被前一条曲线切出的子边上常见）$\Rightarrow$ 把该无向边（含 twin）
+  标为屏障。
+\item \texttt{mark\_edge\_cut\_anywhere(a, b)}：$a,b$ 可能被前面的弦切成了相邻子面
+  的公共边 $\Rightarrow$ 在 $a$ 的整个扇形里找。
+\item 两者都不中才是真正的对角线弦，交给 \texttt{add\_chord}：由
+  \texttt{find\_face\_with\_both} 找到共面则 \texttt{split\_face}，
+  否则递归调用 \texttt{insert\_crossing\_vertex}（深度上限 64）。
+\end{enumerate}
+旧实现在第 1、2 步失配时直接丢弃该段，切割链在此断成 degree-1 端点。
+
+\paragraph{边界安全的顶点扇形（\texttt{faces\_around\_vertex}）}
+单向轨道 \texttt{he}$\to$\texttt{next(twin(he))} 一旦遇到 \texttt{twin = MAX}
+（接缝 / 域边界）就断，只覆盖一侧扇形。旧实现在此直接返回，导致落在边界顶点
+（$v\equiv0/2\pi$ 接缝点、四个角点）上的弦找不到共面而被丢弃。现改为正反双向遍历，
+完整覆盖扇形。
+
+\section{区域指派：\texttt{assign\_connected\_components\_knot}}
+\label{sec:whyformula}
+
+\subsection*{解析拓扑不变量}
+
+对两条曲线参数 $k_1,k_2$（整数，$d=|k_2-k_1|$），定义
 \[
-\mathrm{bands} = \big[\mathrm{band}(u,v,k_1),\; \mathrm{band}(u,v,k_2),\;\dots\big]
+\boxed{\;
+L(u,v) = \left(\left\lfloor \frac{v-k_1 u}{2\pi} \right\rfloor
+              -\left\lfloor \frac{v-k_2 u}{2\pi} \right\rfloor \right) \bmod d
+\;}
 \]
-把所有面的 \texttt{bands} 插入 \texttt{BTreeSet<Vec<isize>>} 去重，得到
-全部互异的条带向量；再为每个互异向量分配一个连续编号 $c\in\{0,1,\dots\}$。
-面的 \texttt{patch\_index} 即设为 $(\texttt{pair\_index}[bands],\,0)$。
 
-\subsection*{UV 平面区域语义}
+$L$ 在环面粘合下不变：
+\begin{itemize}
+\item $u\to u+2\pi$：两个 $\lfloor\cdot\rfloor$ 分量各减 $k_1$、$k_2$，差变化 $k_2-k_1$，模 $d$ 后不变；
+\item $v\to v+2\pi$：两个分量各加 1，差不变。
+\end{itemize}
+故 $L$ 是合法的环面拓扑不变量，直接给出每个面所属区域，\textbf{无需任何 flood-fill}。
 
-knot 曲线 $v=k\,u+2\pi n$ 的 $k$ 条分支把 UV 平面分成 $k+1$ 条带，每条带
-一个区域颜色（ByRegion 着色需求）。环面拓扑上单条闭曲线不分割环面（所有带
-经包裹连通），但 UV 展开平面的视觉区域应独立着色——即用户可见的“区域”。
+\subsection*{实现要点}
 
-\section{着色查找与可见性：\texttt{rebuild\_render\_state}}
+\begin{lstlisting}[]
+let d_isize = if d < 1e-9 { 0 } else { (d + 0.5) as isize };
+if d_isize == 0 {                    // 单条曲线 / k1 == k2
+    // (1,k) 是**非分离**闭曲线，不分割环面 => 1 区域
+    for f in &mut mesh.faces { if f.valid {
+        f.component_id = Some(0); f.patch_index = Some((0, 0)); } }
+    return 1;
+}
+for each valid face {
+    let (cu_raw, cv_raw) = circular_centroid(mesh, &hes, ...);  // 接缝环绕安全
+    let cu = normalize_uv(cu_raw, min_u, max_u);   // 归一化到 [0, 2pi)
+    let cv = normalize_uv(cv_raw, min_v, max_v);
+    let n1 = ((cv - k1 * cu) / two_pi).floor() as isize;
+    let n2 = ((cv - k2 * cu) / two_pi).floor() as isize;
+    let raw = (((n1 - n2) % d_isize) + d_isize) % d_isize;      // 非负取模
+}
+// 最后把出现过的 raw 值重映射为紧凑索引 0..n，写入 component_id 与 patch_index
+\end{lstlisting}
 
-渲染时每个面的颜色索引为 $\mathrm{pu} = \mathrm{patch\_index}.0$，颜色取自
-\texttt{color\_scheme::generate\_patch\_colors(max\_pu+1,\ 1,\ scheme)}。
-\texttt{patch\_visible} 在每次 \texttt{reapply\_cuts} 时重置为
-\texttt{[true; max\_pu+1]}，可在 Shader 标签页逐补片显隐。
+三个细节缺一不可：
+\begin{itemize}
+\item \textbf{面中心用 \texttt{circular\_centroid}}：先相对首顶点解缠再取均值，
+  跨接缝面的质心才落在面的真实位置；直接算算术平均会把跨缝面的质心甩到域中央。
+\item \textbf{先 \texttt{normalize\_uv} 到 $[0,2\pi)$}：曲线方程定义在归一化角度
+  空间，故 UI 自定义的非 $(0,2\pi)$ \texttt{uv\_range} 也能正确处理。
+\item \textbf{紧凑重映射}：把实际出现的 $L$ 值映射为连续 $0..n$，保证调色板与
+  补片索引不留空洞。
+\end{itemize}
+
+\subsection*{区域数定理}
+
+环面上两条 $(p,q)$、$(p',q')$ 闭曲线把环面分成
+\[
+|p\,q' - p'\,q|
+\]
+块。本项目的曲线均为 $(1,k)$ 形式，故区域数 $=|1\cdot k_2-1\cdot k_1|=|k_2-k_1|$。
+单条 $(1,k)$ 曲线（$k_1=k_2$）是\textbf{非分离}闭曲线：割开后仍连通，$1$ 个区域。
+
+\subsection*{为何取代 flood-fill}
+
+旧 \texttt{assign\_connected\_components} 沿 \texttt{twin} 半边 flood-fill、以
+\texttt{cut} 边为屏障，并跨 \texttt{twin = MAX} 的边界半边按 \texttt{build\_seam\_pairs}
+配对“缝合”以恢复环面拓扑。该路径在大幅 $k$ 值下本质脆弱：曲线在接缝处只切出
+\textbf{端点}（split 出顶点），接缝边自身 \texttt{cut = false}，缝合逻辑于是跨缝
+连通、把本应切开的区域合并回一块。实测 $k=[3,10]$（应 7 块）得 \texttt{comps = 1}；
+补加“端点不是切点则不缝合”的条件仍不足——总有足够多接缝边被缝合。
+$k=[3,6]$ 之所以曾侥幸正确，只是切点位置的数学巧合。
+
+因此 knot 模式一律走解析公式；\texttt{assign\_connected\_components}（flood-fill）
+仅保留给\textbf{导入的 OBJ 网格}——那里没有环面接缝语义可利用。
+
+\section{与 Grid 模式的区别}
+
+环面内部的 U/V 常值切割线同样是\textbf{非分离}曲线，整个网格切完仍只有 1 个拓扑
+连通块。因此 Grid 模式\textbf{不能}按 \texttt{component\_id} 着色，而按网格单元：
+\[
+\texttt{component\_id} = p_u\cdot num_v + p_v
+\]
+两种模式的调色板分支不同：Grid 传 $(num_u, num_v)$ 走 2D 分支，
+Knot 传 $(n, 1)$ 走 1D 分支，入口同为 \texttt{generate\_patch\_colors}。
+分派在 \texttt{app.rs} 的 \texttt{reapply\_cuts} 与
+\texttt{recolor\_patches} 中按 \texttt{cut\_mode} 完成，两条链路互不干扰。
+
+\paragraph{1D 调色板与 PBR}
+1D 分支的色相必须均匀铺开 $h_i=i/n$；旧公式 $(j+4i)\bmod 8$ 在 $n_v=1$ 时退化
+（$h\in\{0,4,0\}$ $\Rightarrow$ 两红一青）。此外饱和色 albedo 经 PBR 高光 $+$ ACES
+色调映射会被推向白色（各通道趋近 1.0），使各区域在屏幕上无法区分，故 1D 调色板的
+\texttt{lightness} 上限取 $0.40$（PBR 加亮后最大通道约 0.48，仍在色相可辨区）。
+
+\section{回归测试与诊断工具}
+
+\begin{center}
+\begin{tabular}{@{}p{5.4cm}p{8.4cm}@{}}
+\hline
+\textbf{测试} & \textbf{断言} \\
+\hline
+\texttt{test\_knot\_seam\_welding\_}\\\texttt{three\_regions} & $npts\in\{200,400,800,1600\}\times$ seed $1..12$ 共 48 组，$k=[3,6]$ 恰 3 区域 \\
+\texttt{test\_knot\_single\_curve\_}\\\texttt{one\_region} & 单条 $(1,k)$ 曲线恰 1 区域 \\
+\texttt{test\_diag\_seam\_and\_barrier} & 多组 $k$ 的区域数：$[1,3]\to2$、$[2,5]\to3$、$[3,6]\to3$、$[3,9]\to6$ \\
+\texttt{diag\_k310\_components\_}\\\texttt{and\_patch\_palette} (\texttt{\#[ignore]}) & $k=[3,10]$ 恰 7 区域 \\
+\texttt{test\_diag\_k36\_leak} (\texttt{\#[ignore]}) & 用同一解析标签定位泄漏边 \\
+\hline
+\end{tabular}
+\end{center}
+
+质量基线：\texttt{cargo test} 全绿、\texttt{cargo clippy --all-targets} 零 warning。
 
 \section{已知边界与注意事项}
 
 \begin{itemize}
-\item \textbf{多分支切割开销}：粗网格 + 大 $k$ 时一个面可能跨 $k$ 条分支，
-  全部切开会显著增加面数；\texttt{cut\_mesh\_by\_grid} 中另有
-  \texttt{MAX\_FACES=150000} 硬上限防止指数增长（knot 切割本身无此上限，
-  依赖修复遍最多 5 次收敛）。
-\item \textbf{顶点恰在 knot 线上}：相邻两边交点被 $t\approx0/1$ 过滤后可能
-  得到 $(0,1)$ 情形（do nothing），面不切分——由于仅一个顶点接触曲线，面整体
-  位于一侧，行为正确。
-\item \textbf{质心 vs 几何}：切割后每个面应整体落在一条带内；若某面本应被切却
-  漏切，其质心可能落入某侧而部分几何落入另一侧，产生区域边界“锯齿”——多分支
-  切割修复遍正是为消除此类漏切。
+\item \textbf{多分支切割开销}：粗网格 $+$ 大 $k$ 时一个面可能跨多条分支，全部切开会
+  显著增加面数。Grid 链路设有面数硬上限 \texttt{MAX\_FACES}$\,=\,$150000；knot 链路
+  无此上限，因为它只单遍扫描初始面集（\texttt{initial\_face\_count}）而不迭代，
+  规模天然有界。
+\item \textbf{单顶点接触}：曲线只碰到面的一个顶点时 \texttt{pts.len() < 2}，不切分。
+  面整体位于曲线一侧，行为正确。
+\item \textbf{质心 vs 几何}：区域指派用面质心。切割正确时每个面整体落在一个区域内，
+  质心判据与几何一致；若某面本应被切却漏切，其质心落入一侧而部分几何落入另一侧，
+  表现为区域边界“锯齿”——这类症状应回溯到切割链路（尤其
+  \texttt{knot\_branch\_range} 与弦落地三段式），而非区域公式。
+\item \textbf{$k$ 必须为整数}：$L$ 的不变性依赖 $k_1,k_2\in\mathbb{Z}$（$u\to u+2\pi$
+  时分量恰好整数移位）。UI 的 $k$ 为整数拖动条，满足该前提。
 \end{itemize}
 
 \end{document}

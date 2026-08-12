@@ -15,7 +15,7 @@ A **wgpu + egui** based torus mesh cutting and UV-unwrapping tool: parametricall
 - **Mesh generation**: quad mesh (adjustable U/V resolution), periodic Delaunay triangulation (Poisson-disk sampling + edge flips), OBJ model loading
 - **Cutting**:
   - U/V Grid cutting: in Quad mode the cut lines align to the mesh vertex lines, **preserving quad faces** (no triangulation)
-  - Torus Knot curve cutting (`v = k·u + 2πn` for all branches), affecting only faces that intersect the curve
+  - Torus Knot curve cutting (`v = k·u + 2πn` for all branches), affecting only faces that intersect the curve; two `(1,k₁)`, `(1,k₂)` curves split the torus into exactly `|k₂−k₁|` topological regions (region ids come from an analytic invariant, no flood-fill)
 - **Patch management**: per-patch visibility, materials, and per-patch shader override (42 modes: PBR / Glass / X-Ray / Toon / Holographic…)
 - **Dual views**: 3D torus view (orbit camera, lighting presets, smooth/flat shading) and UV-plane unwrap view (`(u·R, v·r)` mapping), switchable from the right-docked panel
 - **Region rendering**: per-patch coloring (Rainbow / Checkerboard / Heatmap / Grayscale)

@@ -267,7 +267,7 @@ fn test_torus_periodicity() {
     assert!(torus_position(u, v + 2.0*PI, major, minor).distance(p) < 1e-5);
 }
 \end{lstlisting}
-即 \texttt{torus\_position(u+2\pi, v) == torus\_position(u, v)}，符合周期性。
+即 $\texttt{torus\_position}(u+2\pi, v) = \texttt{torus\_position}(u, v)$，符合周期性。
 
 \subsection{test\_torus\_geometry}
 

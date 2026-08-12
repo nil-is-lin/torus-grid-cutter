@@ -50,7 +50,8 @@
 \item 导出格式为 \textbf{OBJ / STL / PLY}，\textbf{没有} OFF 导出；
 \item 相交检测用 \texttt{normalize\_uv} + \texttt{unwrap\_angle} 展开 UV，\textbf{不是}“枚举 5 个 du 偏移”；
 \item patch 编号用 \texttt{circular\_centroid} + \texttt{find\_region\_index}（对排序后的切割值二分查找），\textbf{不是} $\lfloor\bar u/w\rfloor\bmod N$；
-\item “在 knot 线上”的容差为 \texttt{MERGE\_EPS = 1e-4}，\textbf{不是} $10^{-8}$；
+\item “在切割线上”的容差为 \texttt{MERGE\_EPS = 1e-4}，\textbf{不是} $10^{-8}$；knot 曲线另用
+  与面无关的顶点吸附容差 \texttt{KNOT\_SNAP\_UV = 1e-3}（$\phi$ 空间乘 $\sqrt{1+k^2}$）；
 \item \texttt{cut\_mesh\_by\_grid} 采用 U/V 交替迭代直到面数稳定（通常 2–3 轮），并有 \texttt{MAX\_FACES=150000} 硬上限保护。
 \end{itemize}
 
@@ -156,7 +157,9 @@ U-常值线：$u = \mathrm{const}$，沿 $v$ 方向延伸；V-常值线：$v = \
 
 \subsection{Torus Knot 曲线}
 
-Knot 曲线 $v = k\,u$ 在参数方域内有 $k$ 条分支（$v = k\,u + 2\pi n$）。支持两条 knot（$k_1, k_2$）独立开关。详见 \texttt{knot\_algorithm.tex}。
+Knot 曲线 $v = k\,u$ 在参数方域内有 $k$ 条分支（$v = k\,u + 2\pi n$）。支持两条 knot（$k_1, k_2$）独立开关。
+每个面须切开其跨越的\textbf{全部}分支，分支范围由 \texttt{knot\_branch\_range} 两端取 $\lfloor\cdot\rfloor$ 给出。
+两条 $(1,k_1)$、$(1,k_2)$ 曲线把环面分成 $|k_2-k_1|$ 个区域。详见 \texttt{knot\_algorithm.tex}。
 
 \subsection{UV 域与周期性}
 
@@ -170,7 +173,7 @@ Knot 曲线 $v = k\,u$ 在参数方域内有 $k$ 条分支（$v = k\,u + 2\pi n$
 
 相交检测不再用“枚举 5 个 du 偏移”，而是：
 \begin{enumerate}
-\item \texttt{normalize\_uv(val, min, max) = (val-min)/(max-min) * 2\pi}：把任意 UV 域 $[min,max]$ 归一化到 $[0,2\pi)$，使 \texttt{unwrap\_angle}（周期 $2\pi$）能正确工作。
+\item \texttt{normalize\_uv(val, min, max)} $=\dfrac{val-min}{max-min}\cdot 2\pi$：把任意 UV 域 $[min,max]$ 归一化到 $[0,2\pi)$，使 \texttt{unwrap\_angle}（周期 $2\pi$）能正确工作。
 \item \texttt{unwrap\_angle(angle, reference)}：通过反复 $\pm 2\pi$ 使
   \texttt{angle - reference} $\in [-\pi, \pi]$，得到相对参考点的连续坐标，正确处理接缝。
 \end{enumerate}
@@ -272,7 +275,10 @@ fn find_region_index(value: f64, sorted_cuts: &[f64]) -> usize {
 周期语义：$n$ 条切割线把环域分成 $n$ 段（值小于第一条线者归入最后一段），故
 \texttt{cut\_grid\_dims} 返回 $(n_u, n_v)$（无切割时为 $(1,1)$）。
 
-Knot 模式则使用 \texttt{assign\_multi\_knot\_patch\_indices}（见 \texttt{knot\_algorithm.tex}）。
+Knot 模式\textbf{不}走上述几何分段，而用解析拓扑不变量
+\texttt{assign\_connected\_components\_knot}：逐面按
+$L=(\lfloor(v-k_1u)/2\pi\rfloor-\lfloor(v-k_2u)/2\pi\rfloor)\bmod|k_2-k_1|$
+指派区域，区域数恒为 $|k_2-k_1|$（单条曲线为 1）。详见 \texttt{knot\_algorithm.tex}。
 
 % ======================================================================
 \section{渲染管线}

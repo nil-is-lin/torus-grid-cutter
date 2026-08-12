@@ -180,7 +180,7 @@
     \node (split_edge) [process, below=1.6cm of cutmode] {split\_edge() + split\_face()};
     \node (triang) [process, below=of split_edge] {triangulate\_face()（局部）};
 
-    \node (assign) [module, below=of triang] {assign\_patch\_indices / assign\_multi\_knot\_patch\_indices};
+    \node (assign) [module, below=of triang] {assign\_patch\_indices / assign\_connected\_components\_knot};
     \node (assign_file) [file, right=2cm of assign] {cut.rs};
 
     \draw [arrow] (reapply) -- (cutmode);
@@ -312,7 +312,7 @@
     \node (mesh_tab) [label, below=of tabs] {"1. Mesh"};
     \node (mesh_src) [input, below=of mesh_tab] {Radio: Quad / Delaunay / OBJ};
     \node (res_u) [input, below=of mesh_src] {Slider: U divisions (res\_u)};
-    \node (res_v) [input, below=of res_v] {Slider: V divisions (res\_v) / Point count};
+    \node (res_v) [input, right=1.0cm of res_u] {Slider: V divisions (res\_v) / Point count};
     \node (major_r) [input, below=of res_u] {Slider: Major Radius (R)};
     \node (minor_r) [input, below=of major_r] {Slider: Minor Radius (r)};
     \node (rebuild_btn) [process, below=of minor_r] {action.rebuild = true};
@@ -526,7 +526,7 @@
     \node (he_mesh) [data, below=of he_build] {HalfEdgeMesh};
     \node (cut) [process, below=of he_mesh] {cut\_mesh\_by\_grid / by\_knots};
     \node (cut_mesh) [data, below=of cut] {切割后的 HalfEdgeMesh};
-    \node (assign) [process, below=of cut_mesh] {assign\_patch\_indices / multi\_knot};
+    \node (assign) [process, below=of cut_mesh] {assign\_patch\_indices / \_components\_knot};
     \node (gpu_data) [data, below=of assign] {GpuVertex[] + indices};
     \node (render) [process, below=of gpu_data] {wgpu 渲染管线};
     \node (image) [data, below=of render] {屏幕图像};
