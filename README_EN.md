@@ -33,6 +33,14 @@ A **wgpu + egui** based torus mesh cutting and UV-unwrapping tool: parametricall
 Recording tips: window 1280×720, OBS / Windows Game Bar both work; recommended length 1–3 minutes.
 Upload steps: drop `demo.mp4` into this repo's `docs/` directory and commit & push.
 
+## Gallery
+
+| U/V grid cut | Torus Knot cut |
+| --- | --- |
+| ![UV cut](assets/example_1.svg) | ![Knot cut](assets/example_2.svg) |
+
+> Left: torus cut along U/V grid lines and unwrapped into patches. Right: topological regions produced by cutting along two `(1,k₁)`, `(1,k₂)` Torus Knot curves.
+
 ## Build
 
 ```bash

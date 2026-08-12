@@ -35,6 +35,14 @@
 录制建议：窗口 1280×720，OBS / Windows Game Bar 均可；建议时长 1–3 分钟。
 上传步骤：将 `demo.mp4` 放入本仓库 `docs/` 目录并提交推送即可。
 
+## 示例
+
+| UV 网格切割 | Torus Knot 曲线切割 |
+| --- | --- |
+| ![UV 切割示例](assets/example_1.svg) | ![Knot 切割示例](assets/example_2.svg) |
+
+> 左：沿 U/V 网格线切割环面并展开为补片；右：沿两条 `(1,k₁)`、`(1,k₂)` Torus Knot 曲线切割得到的拓扑区域。
+
 ## 构建
 
 
