@@ -73,7 +73,7 @@ pub fn generate_delaunay_mesh(
     let mut rng = SimpleRng::new(seed);
 
     // 边界固定点（与 quad 网格的接缝方案一致）：四条边（u=0、u=2π、v=0、v=2π）
-    // 各放 boundary_n 个固定点。对边（如 v=0 与 v=2π）是**独立顶点**（3D 位置
+    // 各放 boundary_n−2 个固定点（避开两端角点）。对边（如 v=0 与 v=2π）是**独立顶点**（3D 位置
     // 周期重合），Delaunay 不会连接它们（距离 2π，空圆必含中间点）→ 网格在
     // 接缝处天然展开（Planar UV 视图规整，3D 视图视觉闭合），无需后续切开。
     let boundary_n = (num_points / 20).clamp(8, 64);
@@ -85,17 +85,27 @@ pub fn generate_delaunay_mesh(
     // 退化/异常三角形。微扰必须**沿边方向**（保持点在凸包边上）——
     // 若垂直推离边，点会落入凸包内部，凸包退化为 4 个角点，产生横跨
     // 矩形的大三角形（视觉裂缝）。
+    //
+    // 两条关键不变量（环面接缝正确性的前提，缺一不可）：
+    //   (a) **跳过 j=0 / j=boundary_n-1**：这两个参数位置就是角点位置。
+    //       若不跳过，u=0 边会在 (0, 0+jx) 处生成一个与角点 (0,0) 仅相距
+    //       ~1e-4 的重复顶点，形成退化 sliver 三角形；knot 曲线在角点处的
+    //       交点会被吸附到该副点而非角点，角点与副点之间残留一小段未切边界
+    //       → flood-fill 从此泄漏、区域错误合并。四条边必须一致跳过。
+    //   (b) **对边共用同一微扰量**：u=0 与 u=2π 用同一 `ju`、v=0 与 v=2π 用
+    //       同一 `jv`，使对边顶点参数完全相同 → 3D 位置精确重合（torus 周期
+    //       2π）→ `build_seam_pairs` 能一一配对，切割后子边也同步细分。
+    //       旧实现对边各用一份随机量（jx / jy），对边顶点错开 ~1e-4，
+    //       接缝配对只能靠宽容差兜住，且切点落在不同子边上时配对失效。
     let jitter = 1e-4;
-    for j in 0..boundary_n {
+    for j in 1..boundary_n.saturating_sub(1) {
         let t = step * j as f64;
-        let jx = rng.next() * jitter;
-        let jy = rng.next() * jitter;
-        uvs.push(Vec2::new(0.0, (t + jx) as f32)); // u=0 边（沿 v 微扰）
-        uvs.push(Vec2::new(two_pi as f32, (t + jy) as f32)); // u=2π 边（沿 v 微扰）
-        if j > 0 && j < boundary_n - 1 {
-            uvs.push(Vec2::new((t + jx) as f32, 0.0)); // v=0 边（沿 u 微扰）
-            uvs.push(Vec2::new((t + jy) as f32, two_pi as f32)); // v=2π 边（沿 u 微扰）
-        }
+        let ju = rng.next() * jitter; // u=0 / u=2π 边共用（沿 v 微扰）
+        let jv = rng.next() * jitter; // v=0 / v=2π 边共用（沿 u 微扰）
+        uvs.push(Vec2::new(0.0, (t + ju) as f32)); // u=0 边
+        uvs.push(Vec2::new(two_pi as f32, (t + ju) as f32)); // u=2π 边（同 v）
+        uvs.push(Vec2::new((t + jv) as f32, 0.0)); // v=0 边
+        uvs.push(Vec2::new((t + jv) as f32, two_pi as f32)); // v=2π 边（同 u）
     }
     // 四个角点（独立顶点）
     uvs.push(Vec2::new(0.0, 0.0));
@@ -123,7 +133,7 @@ pub fn generate_delaunay_mesh(
     log::info!(
         "Delaunay: {} points ({} boundary + {} interior) → {} triangles",
         uvs.len(),
-        4 * boundary_n,
+        4 * boundary_n.saturating_sub(2) + 4,
         interior,
         triangles.len()
     );

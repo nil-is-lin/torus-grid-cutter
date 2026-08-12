@@ -634,26 +634,9 @@ impl App {
                         );
                     }
                     crate::ui::panel::CutMode::Knot => {
-                        let mut k_values = Vec::new();
-                        if self.ui_state.knot_cut_1 {
-                            k_values.push(self.ui_state.knot_k1);
-                        }
-                        if self.ui_state.knot_cut_2 {
-                            k_values.push(self.ui_state.knot_k2);
-                        }
-                        if !k_values.is_empty() {
-                            crate::mesh::cut::assign_multi_knot_patch_indices(
-                                &mut mesh,
-                                &k_values,
-                                self.ui_state.uv_range,
-                            );
-                        } else {
-                            for f in &mut mesh.faces {
-                                if f.valid {
-                                    f.patch_index = Some((0, 0));
-                                }
-                            }
-                        }
+                        // Knot 模式的 component_id / patch_index 由下方着色分支
+                        // 经解析拓扑不变量统一指派（见 CutMode::Knot 着色分支），
+                        // 此处无需预指派。
                     }
                 }
             } else if obj_files == 0 {
@@ -666,17 +649,65 @@ impl App {
             // 注：OBJ 多选导入（无切割线）时 obj_files > 0，不进入上面的
             // else 分支，从而保留导入时写入的逐文件 patch_index。
 
-            if self.ui_state.cut_mode == crate::ui::panel::CutMode::Knot {
-                let max_pu = mesh
-                    .faces
-                    .iter()
-                    .filter(|f| f.valid)
-                    .filter_map(|f| f.patch_index.map(|p| p.0))
-                    .max()
-                    .unwrap_or(0);
-                self.patch_colors =
-                    color_scheme::generate_patch_colors(max_pu + 1, 1, &self.ui_state.color_scheme);
-                self.ui_state.patch_visible = vec![true; max_pu + 1];
+            // 着色索引策略（ByRegion 用 face.component_id 查 patch_colors）：
+            //   - Grid：按 (i,j) 网格单元着色。环面内部 U/V 切割线为非分离曲线，
+            //     整面仍是单一拓扑连通块；若按连通块着色只会是一种颜色，
+            //     失去网格分区的意义。故 component_id = 网格单元线性索引，
+            //     patch_colors 用上方 Grid 分支生成的二维调色板（num_u × num_v）。
+            //   - Knot：按拓扑连通块着色（曲线把环面分成多个区域）。
+            if self.ui_state.has_cut_loops() {
+                match self.ui_state.cut_mode {
+                    crate::ui::panel::CutMode::Grid => {
+                        let num_v = self.ui_state.cut_v_values().len().max(1);
+                        for f in &mut mesh.faces {
+                            if let Some((pu, pv)) = f.patch_index {
+                                f.component_id = Some(pu * num_v + pv);
+                            }
+                        }
+                        // patch_colors 保持上方 Grid 分支生成的二维调色板，不覆盖。
+                    }
+                    crate::ui::panel::CutMode::Knot => {
+                        // 直接用解析拓扑不变量指派区域（区域数 = |k2−k1|）：
+                        // 同时写 component_id（ByRegion 着色）与 patch_index（补片面版）。
+                        // k1/k2 由勾选状态推导：都未勾选时取相等值 → d=0 → 1 区域
+                        // （未切割的整环面恰 1 个连通块）。
+                        let (k1, k2) = match (self.ui_state.knot_cut_1, self.ui_state.knot_cut_2) {
+                            (true, true) => {
+                                (self.ui_state.knot_k1 as f64, self.ui_state.knot_k2 as f64)
+                            }
+                            (true, false) => {
+                                (self.ui_state.knot_k1 as f64, self.ui_state.knot_k1 as f64)
+                            }
+                            (false, true) => {
+                                (self.ui_state.knot_k2 as f64, self.ui_state.knot_k2 as f64)
+                            }
+                            (false, false) => {
+                                (self.ui_state.knot_k1 as f64, self.ui_state.knot_k1 as f64)
+                            }
+                        };
+                        let num_components = crate::mesh::cut::assign_connected_components_knot(
+                            &mut mesh,
+                            k1,
+                            k2,
+                            self.ui_state.uv_range,
+                        );
+                        if num_components > 0 {
+                            self.patch_colors = color_scheme::generate_patch_colors(
+                                num_components,
+                                1,
+                                &self.ui_state.color_scheme,
+                            );
+                        }
+                        let max_pu = mesh
+                            .faces
+                            .iter()
+                            .filter(|f| f.valid)
+                            .filter_map(|f| f.patch_index.map(|p| p.0))
+                            .max()
+                            .unwrap_or(0);
+                        self.ui_state.patch_visible = vec![true; max_pu + 1];
+                    }
+                }
             }
 
             mesh = self.to_3d_view_mesh(&mesh);
@@ -756,13 +787,23 @@ impl App {
 
     fn recolor_patches(&mut self) {
         if let Some(ref mut mesh) = self.torus_mesh {
-            // OBJ 多选导入（无切割线）：保留导入时写入的逐文件 patch_index，
-            // 仅按文件数重新生成配色，避免被 UV 网格重排补片而丢失逐文件分组。
+            // OBJ 多选导入（无切割线）：保留导入时写入的逐文件 patch_index
+            // （补片面板/显隐分组），但 ByRegion 按拓扑连通块着色（与
+            // reapply_cuts 一致）——每个 OBJ 文件通常是一个连通块。
             if let MeshType::ObjFile(paths) = &self.ui_state.mesh_type {
                 if !self.ui_state.has_cut_loops() {
                     let n = paths.len().max(1);
-                    self.patch_colors =
-                        color_scheme::generate_patch_colors(n, 1, &self.ui_state.color_scheme);
+                    let num_components = crate::mesh::cut::assign_connected_components(mesh);
+                    if num_components > 0 {
+                        self.patch_colors = color_scheme::generate_patch_colors(
+                            num_components,
+                            1,
+                            &self.ui_state.color_scheme,
+                        );
+                    } else {
+                        self.patch_colors =
+                            color_scheme::generate_patch_colors(n, 1, &self.ui_state.color_scheme);
+                    }
                     self.ui_state.patch_visible = vec![true; n];
                     self.rebuild_render_state();
                     return;
@@ -772,34 +813,57 @@ impl App {
                 crate::ui::panel::CutMode::Grid => {
                     let u_vals = self.ui_state.cut_u_values();
                     let v_vals = self.ui_state.cut_v_values();
-                    let num_u = u_vals.len().max(1);
-                    let num_v = v_vals.len().max(1);
-                    self.patch_colors = color_scheme::generate_patch_colors(
-                        num_u,
-                        num_v,
-                        &self.ui_state.color_scheme,
-                    );
                     crate::mesh::cut::assign_patch_indices(
                         mesh,
                         &u_vals,
                         &v_vals,
                         self.ui_state.uv_range,
                     );
+                    let num_u = u_vals.len().max(1);
+                    let num_v = v_vals.len().max(1);
+                    // 按 (i,j) 网格单元着色：component_id = 单元线性索引，
+                    // 供 ByRegion 查二维调色板（num_u × num_v）。
+                    for f in &mut mesh.faces {
+                        if let Some((pu, pv)) = f.patch_index {
+                            f.component_id = Some(pu * num_v + pv);
+                        }
+                    }
+                    self.patch_colors = color_scheme::generate_patch_colors(
+                        num_u,
+                        num_v,
+                        &self.ui_state.color_scheme,
+                    );
+                    // 注意：2D 网格补片着色用二维调色板（非 1D 连通块调色板），
+                    // 否则整面单一连通块 → 一个颜色，失去网格分区意义。
                 }
                 crate::ui::panel::CutMode::Knot => {
-                    // 与 reapply_cuts 保持一致：只对启用了切割的 knot 重新指派 patch
-                    let mut k_values = Vec::new();
-                    if self.ui_state.knot_cut_1 {
-                        k_values.push(self.ui_state.knot_k1);
-                    }
-                    if self.ui_state.knot_cut_2 {
-                        k_values.push(self.ui_state.knot_k2);
-                    }
-                    if !k_values.is_empty() {
-                        crate::mesh::cut::assign_multi_knot_patch_indices(
-                            mesh,
-                            &k_values,
-                            self.ui_state.uv_range,
+                    // 与 reapply_cuts 一致：直接用解析拓扑不变量指派区域
+                    // （区域数 = |k2−k1|），同时写 component_id 与 patch_index。
+                    let (k1, k2) = match (self.ui_state.knot_cut_1, self.ui_state.knot_cut_2) {
+                        (true, true) => {
+                            (self.ui_state.knot_k1 as f64, self.ui_state.knot_k2 as f64)
+                        }
+                        (true, false) => {
+                            (self.ui_state.knot_k1 as f64, self.ui_state.knot_k1 as f64)
+                        }
+                        (false, true) => {
+                            (self.ui_state.knot_k2 as f64, self.ui_state.knot_k2 as f64)
+                        }
+                        (false, false) => {
+                            (self.ui_state.knot_k1 as f64, self.ui_state.knot_k1 as f64)
+                        }
+                    };
+                    let num_components = crate::mesh::cut::assign_connected_components_knot(
+                        mesh,
+                        k1,
+                        k2,
+                        self.ui_state.uv_range,
+                    );
+                    if num_components > 0 {
+                        self.patch_colors = color_scheme::generate_patch_colors(
+                            num_components,
+                            1,
+                            &self.ui_state.color_scheme,
                         );
                     }
                     let max_pu = mesh
@@ -809,11 +873,6 @@ impl App {
                         .filter_map(|f| f.patch_index.map(|p| p.0))
                         .max()
                         .unwrap_or(0);
-                    self.patch_colors = color_scheme::generate_patch_colors(
-                        max_pu + 1,
-                        1,
-                        &self.ui_state.color_scheme,
-                    );
                     // 同步 patch_visible，避免 rebuild_render_state 按旧长度索引越界
                     self.ui_state.patch_visible = vec![true; max_pu + 1];
                 }
@@ -915,12 +974,9 @@ impl App {
 
             let color = match self.ui_state.color_mode {
                 ColorMode::Solid => self.ui_state.base_color,
-                ColorMode::ByRegion => match face.patch_index {
+                ColorMode::ByRegion => match face.component_id {
                     None => self.ui_state.base_color,
-                    Some((pu, pv)) => {
-                        let idx = pu * cut_nv + pv;
-                        patch_colors.get(idx).copied().unwrap_or(default_color)
-                    }
+                    Some(cid) => patch_colors.get(cid).copied().unwrap_or(default_color),
                 },
             };
 

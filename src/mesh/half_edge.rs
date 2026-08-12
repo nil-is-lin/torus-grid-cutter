@@ -49,6 +49,9 @@ pub struct HalfEdge {
     pub next: HalfEdgeId,
     pub prev: HalfEdgeId,
     pub face: FaceId,
+    /// 该无向边位于某条切割曲线上（切割产生的 diag 边、或沿切割线
+    /// 对齐的原边）。连通块 flood-fill 视为不连通——ByRegion 拓扑分块依据。
+    pub cut: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -56,6 +59,10 @@ pub struct HEFace {
     pub half_edge: HalfEdgeId,
     pub valid: bool,
     pub patch_index: Option<(usize, usize)>,
+    /// Topological connected-component ID assigned after cutting.
+    /// Faces reachable via twin half-edges (across un-cut edges) share the same ID.
+    /// Used by `ColorMode::ByRegion` for correct patch coloring.
+    pub component_id: Option<usize>,
 }
 
 // ── Mesh container ──────────────────────────────────────────────────
@@ -128,6 +135,7 @@ impl HalfEdgeMesh {
                 next: he1,
                 prev: he2,
                 face: face_id,
+                cut: false,
             });
             // he1: v1 -> v2
             mesh.half_edges.push(HalfEdge {
@@ -136,6 +144,7 @@ impl HalfEdgeMesh {
                 next: he2,
                 prev: he0,
                 face: face_id,
+                cut: false,
             });
             // he2: v2 -> v0
             mesh.half_edges.push(HalfEdge {
@@ -144,12 +153,14 @@ impl HalfEdgeMesh {
                 next: he0,
                 prev: he1,
                 face: face_id,
+                cut: false,
             });
 
             mesh.faces.push(HEFace {
                 half_edge: he0,
                 valid: true,
                 patch_index: None,
+                component_id: None,
             });
 
             // Set outgoing half-edge for each vertex
@@ -206,6 +217,7 @@ impl HalfEdgeMesh {
                 next: he1,
                 prev: he3,
                 face: face_id,
+                cut: false,
             });
             mesh.half_edges.push(HalfEdge {
                 origin: VertexId(v1),
@@ -213,6 +225,7 @@ impl HalfEdgeMesh {
                 next: he2,
                 prev: he0,
                 face: face_id,
+                cut: false,
             });
             mesh.half_edges.push(HalfEdge {
                 origin: VertexId(v2),
@@ -220,6 +233,7 @@ impl HalfEdgeMesh {
                 next: he3,
                 prev: he1,
                 face: face_id,
+                cut: false,
             });
             mesh.half_edges.push(HalfEdge {
                 origin: VertexId(v3),
@@ -227,12 +241,14 @@ impl HalfEdgeMesh {
                 next: he0,
                 prev: he2,
                 face: face_id,
+                cut: false,
             });
 
             mesh.faces.push(HEFace {
                 half_edge: he0,
                 valid: true,
                 patch_index: None,
+                component_id: None,
             });
 
             mesh.vertices[v0].outgoing = he0;
@@ -257,8 +273,12 @@ impl HalfEdgeMesh {
     pub fn face_half_edges(&self, face: FaceId) -> Vec<HalfEdgeId> {
         let start = self.faces[face.0].half_edge;
         let mut result = vec![start];
+        // Safety cap: a malformed half-edge cycle that never returns to `start`
+        // would otherwise loop forever. The bound is generous — no valid face
+        // can have more half-edges than the whole mesh.
+        let cap = self.half_edges.len() + 1;
         let mut current = self.half_edges[start.0].next;
-        while current != start {
+        while current != start && result.len() < cap {
             result.push(current);
             current = self.half_edges[current.0].next;
         }
@@ -315,6 +335,7 @@ impl HalfEdgeMesh {
             next: old_next,
             prev: he_id,
             face: self.half_edges[he_id.0].face,
+            cut: self.half_edges[he_id.0].cut,
         });
 
         // Update he
@@ -337,6 +358,7 @@ impl HalfEdgeMesh {
                 next: old_twin_next,
                 prev: twin_id,
                 face: self.half_edges[twin_id.0].face,
+                cut: self.half_edges[twin_id.0].cut,
             });
 
             // Update twin: B → V_new
@@ -365,11 +387,118 @@ impl HalfEdgeMesh {
         v_new
     }
 
+    /// Insert an interior vertex `pos` into `face` and fan-triangulate the face
+    /// around it — i.e. replace `face` (a polygon) with a triangle fan rooted at
+    /// the new vertex. Returns the new vertex id and, for each original boundary
+    /// vertex `v_i`, the half-edge `P -> v_i` (so the caller can mark chord
+    /// segments that pass through `P` as `cut` barriers).
+    ///
+    /// Used when two cut curves cross *inside* a face: the crossing point must be
+    /// a real mesh vertex so that the four incident faces are separated by the
+    /// two curves (a transverse crossing), instead of the two curves meeting at a
+    /// vertex as one series-connected loop.
+    ///
+    /// All new fan half-edges are created with `cut = false` (the caller marks
+    /// the chord sub-segments). The original boundary half-edges keep their twins
+    /// (neighbouring faces are untouched).
+    pub fn insert_interior_vertex_fan(
+        &mut self,
+        face: FaceId,
+        pos: Vec3,
+        uv: Vec2,
+    ) -> (VertexId, Vec<HalfEdgeId>) {
+        let hes = self.face_half_edges(face);
+        let m = hes.len();
+        let p = self.add_vertex(pos, uv);
+        if m < 3 {
+            return (p, Vec::new());
+        }
+        let origs: Vec<VertexId> = hes.iter().map(|&h| self.half_edges[h.0].origin).collect();
+
+        // Interior half-edge pairs: pe_i = P->v_i (in T_i), ie_i = v_i->P (in T_{i-1}).
+        // pe_i and ie_i are twins of each other.
+        let mut pe: Vec<HalfEdgeId> = Vec::with_capacity(m);
+        let mut ie: Vec<HalfEdgeId> = Vec::with_capacity(m);
+        for _ in 0..m {
+            let id = HalfEdgeId(self.half_edges.len());
+            pe.push(id);
+            self.half_edges.push(HalfEdge {
+                origin: p,
+                twin: HalfEdgeId(usize::MAX),
+                next: HalfEdgeId(usize::MAX),
+                prev: HalfEdgeId(usize::MAX),
+                face: FaceId(usize::MAX),
+                cut: false,
+            });
+        }
+        for i in 0..m {
+            let id = HalfEdgeId(self.half_edges.len());
+            ie.push(id);
+            self.half_edges.push(HalfEdge {
+                origin: origs[i],
+                twin: pe[i],
+                next: HalfEdgeId(usize::MAX),
+                prev: HalfEdgeId(usize::MAX),
+                face: FaceId(usize::MAX),
+                cut: false,
+            });
+            self.half_edges[pe[i].0].twin = id;
+        }
+
+        // Reuse `face` as T_0 and create m-1 new faces T_1..T_{m-1}.
+        // T_i = (P, v_i, v_{i+1}); cycle: pe_i -> h_i -> ie_{i+1} -> pe_i.
+        for i in 0..m {
+            let fi = if i == 0 {
+                face
+            } else {
+                self.faces.push(HEFace {
+                    half_edge: pe[i],
+                    valid: true,
+                    patch_index: self.faces[face.0].patch_index,
+                    component_id: None,
+                });
+                FaceId(self.faces.len() - 1)
+            };
+            if i == 0 {
+                self.faces[face.0].half_edge = pe[i];
+            }
+            self.half_edges[pe[i].0].face = fi;
+            self.half_edges[hes[i].0].face = fi; // h_i = v_i -> v_{i+1} (reused)
+            self.half_edges[ie[(i + 1) % m].0].face = fi;
+        }
+
+        for i in 0..m {
+            let h_i = hes[i];
+            let ie_next = ie[(i + 1) % m];
+            self.half_edges[pe[i].0].next = h_i;
+            self.half_edges[pe[i].0].prev = ie_next;
+            self.half_edges[h_i.0].next = ie_next;
+            self.half_edges[h_i.0].prev = pe[i];
+            self.half_edges[ie_next.0].next = pe[i];
+            self.half_edges[ie_next.0].prev = h_i;
+        }
+
+        self.vertices[p.0].outgoing = pe[0];
+        for i in 0..m {
+            self.vertices[origs[i].0].outgoing = hes[i];
+        }
+
+        (p, pe)
+    }
+
     /// Split a face along a diagonal between two of its boundary vertices.
     ///
     /// `v_a` and `v_b` must be distinct vertices on the boundary of `face`.
     /// `v_a` must come before `v_b` in the CCW cycle.
-    pub fn split_face(&mut self, face: FaceId, v_a: VertexId, v_b: VertexId) -> FaceId {
+    /// `cut_edge` 标记该对角线是否位于切割曲线上（切割操作产生 → true；
+    /// fan 三角化/其他细分 → false）。cut 边在连通块 flood-fill 中视为不连通。
+    pub fn split_face(
+        &mut self,
+        face: FaceId,
+        v_a: VertexId,
+        v_b: VertexId,
+        cut_edge: bool,
+    ) -> FaceId {
         if v_a == v_b {
             return face; // degenerate
         }
@@ -419,6 +548,7 @@ impl HalfEdgeMesh {
             half_edge: diag_ba,
             valid: true,
             patch_index: self.faces[face.0].patch_index,
+            component_id: None,
         });
 
         // diag_ab: v_a → v_b
@@ -430,6 +560,7 @@ impl HalfEdgeMesh {
             next: he_b,
             prev: prev_he_a,
             face,
+            cut: cut_edge,
         });
 
         // diag_ba: v_b → v_a
@@ -439,6 +570,7 @@ impl HalfEdgeMesh {
             next: he_a,
             prev: prev_he_b,
             face: new_face_id,
+            cut: cut_edge,
         });
 
         // Rewire surrounding half-edges

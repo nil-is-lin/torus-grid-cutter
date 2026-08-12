@@ -21,20 +21,42 @@ pub fn generate_patch_colors(nu: usize, nv: usize, scheme: &ColorScheme) -> Vec<
     let mut colors = Vec::with_capacity(nu * nv);
     match scheme {
         ColorScheme::Rainbow => {
-            // 相邻补片优先：hue 8 等分 × 亮度 4 级 × 饱和度 2 级 = 64 色。
-            //   hue  = (j + 4i) % 8  → 同行相邻 45°、同列相邻 180°（互补）
-            //   light = (i + 2j) % 4 → 相邻行列亮度错位 2 级
-            // 实测 4 邻域最小色差 0.44（旧黄金角方案 0.09、上一版 0.17），
-            // ≤ 64 补片（含 8×8）全部唯一。
-            for i in 0..nu {
-                for j in 0..nv {
-                    let h8 = (j + 4 * i) % 8;
-                    let l4 = (i + 2 * j) % 4;
-                    let s2 = (i / 4 + j / 4) % 2;
-                    let hue = h8 as f32 / 8.0;
-                    let sat = 0.7 + 0.3 * s2 as f32;
-                    let light = 0.4 + 0.15 * l4 as f32;
-                    colors.push(hsl_to_rgb(hue, sat, light));
+            // 一维调色板（nv == 1，用于 ByRegion 拓扑连通块 / 多文件 OBJ）：
+            // 沿色相环均匀铺开，保证 n 个区域清晰可辨。
+            //
+            // 旧 2D 公式 (j+4i)%8 在 nv==1 时退化成 hue∈{0,4,0} → 两个红色 + 一个青色，
+            // 3 个区域里有两个看起来几乎一样（"区域着色不对"）。
+            //
+            // 关键：lightness 必须 ≤ 0.40！PBR + 强定向光 + ACES 色调映射会把
+            // 高亮面饱和度的 albedo（light ≥ 0.5 × 光照强度）所有通道推到 1.0 →
+            // 全部塌成奶白色（屏幕上看起来是单一颜色）。
+            // light = 0.4 让最大通道输出约 0.48，留出充分余量给 PBR 加亮后保持
+            // 可区分的色相。饱和度适当提到 0.85 补偿亮度损失。
+            if nv == 1 {
+                for i in 0..nu {
+                    let hue = if nu <= 1 {
+                        0.58
+                    } else {
+                        (i as f32) / (nu as f32)
+                    };
+                    colors.push(hsl_to_rgb(hue, 0.85, 0.40));
+                }
+            } else {
+                // 二维网格补片：相邻补片优先 —— hue 8 等分 × 亮度 4 级 × 饱和度 2 级 = 64 色。
+                //   hue  = (j + 4i) % 8  → 同行相邻 45°、同列相邻 180°（互补）
+                //   light = (i + 2j) % 4 → 相邻行列亮度错位 2 级
+                // 实测 4 邻域最小色差 0.44（旧黄金角方案 0.09、上一版 0.17），
+                // ≤ 64 补片（含 8×8）全部唯一。
+                for i in 0..nu {
+                    for j in 0..nv {
+                        let h8 = (j + 4 * i) % 8;
+                        let l4 = (i + 2 * j) % 4;
+                        let s2 = (i / 4 + j / 4) % 2;
+                        let hue = h8 as f32 / 8.0;
+                        let sat = 0.7 + 0.3 * s2 as f32;
+                        let light = 0.4 + 0.15 * l4 as f32;
+                        colors.push(hsl_to_rgb(hue, sat, light));
+                    }
                 }
             }
         }
