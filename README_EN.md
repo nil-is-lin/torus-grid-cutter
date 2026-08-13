@@ -10,6 +10,9 @@
 
 A **wgpu + egui** based torus mesh cutting and UV-unwrapping tool: parametrically generate torus meshes (quad / periodic Delaunay / OBJ), cut them into patches along U/V grid lines or Torus Knot curves, with 42 shader rendering modes, a UV-plane unwrap view, and per-patch OBJ export.
 
+> This project is an entry for the **Computable Discrete Global Geometry Structure Challenge**.
+> See the [official announcement](https://mp.weixin.qq.com/s/PLUvhLfcE-Q8CQENXAoH9A).
+
 ## Features
 
 - **Mesh generation**: quad mesh (adjustable U/V resolution), periodic Delaunay triangulation (Poisson-disk sampling + edge flips), OBJ model loading

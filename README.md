@@ -10,6 +10,9 @@
 
 基于 **wgpu + egui** 的环面网格切割与 UV 展开工具：参数化生成环面网格（四边形 / 周期 Delaunay / OBJ），沿 U/V 网格线或 Torus Knot 曲线切割成补片（patch），支持 42 种着色器渲染、UV 平面展开视图与按补片导出 OBJ。
 
+> 本项目为 **可计算离散整体几何结构挑战赛** 参赛作品，赛题说明见
+> [官方推文](https://mp.weixin.qq.com/s/PLUvhLfcE-Q8CQENXAoH9A)。
+
 ## 功能特性
 
 - **网格生成**：四边形网格（可调 U/V 分辨率）、周期 Delaunay 三角网格（泊松盘采样 + 边翻转）、加载 OBJ 模型
